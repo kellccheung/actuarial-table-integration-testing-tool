@@ -1,0 +1,154 @@
+@startuml prophet_table_tool_classes
+title Prophet Table Change Tool — Class Diagram
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam packageStyle rectangle
+
+package "control" {
+  class ControlConfig {
+    +control_path: Path
+    +working_root: Path
+    +mode: str
+    +production_tables_path: Path
+    +output_path: Path
+    +run_id: str
+    +change_requests: List~ChangeRequestRow~
+    +column_renames: List~ColumnRename~
+    +key_count_approvals: List~KeyCountApproval~
+    --
+    +included_requests(require_approved: bool): List~ChangeRequestRow~
+    +change_request_dir(change_request_id: str): Path
+    +renames_for(cr_id: str, table: str): List~ColumnRename~
+    +is_key_count_approved(cr_id: str, table: str): bool
+  }
+
+  class ChangeRequestRow {
+    +change_request_id: str
+    +order: int
+    +include: bool
+    +approved: bool
+    +description: str
+    +notes: str
+  }
+
+  class ColumnRename {
+    +change_request_id: str
+    +table_name: str
+    +old_column_name: str
+    +new_column_name: str
+  }
+
+  class KeyCountApproval {
+    +change_request_id: str
+    +table_name: str
+    +approved: bool
+  }
+
+  class read_control <<function>> {
+    +read_control(control_path: Path): ControlConfig
+  }
+}
+
+package "prophet_csv" {
+  class ProphetTable {
+    +n_keys: int
+    +columns: List~str~
+    +data: DataFrame
+    +source_path: Path?
+    --
+    +key_columns: List~str~ {get}
+    +value_columns: List~str~ {get}
+    +with_key_tuple(): DataFrame
+  }
+
+  class prophet_csv_io <<functions>> {
+    +read_prophet_csv(path: Path): ProphetTable
+    +write_prophet_csv(table: ProphetTable, path: Path): void
+    +discover_csv_tables(folder: Path): Dict~str, Path~
+  }
+}
+
+package "diff" {
+  class ChangeRow {
+    +change_request_id: str
+    +table_name: str
+    +change_type: str
+    +n_keys_before: int?
+    +n_keys_after: int?
+    +key_tuple: str
+    +column_name: str
+    +old_value: str
+    +new_value: str
+    +notes: str
+  }
+
+  class DiffResult {
+    +change_rows: List~ChangeRow~
+    +warnings: List~str~
+    +tables_touched: Set~str~
+  }
+
+  class diff_functions <<functions>> {
+    +diff_table(cr_id, table_name, before, after, control): DiffResult
+    +detect_conflicts(change_rows): List~dict~
+    +format_key_tuple(values): str
+  }
+
+  note right of ChangeRow
+    change_type values:
+    value_update | row_add | row_delete
+    column_add | column_delete | column_rename
+    key_count_change | table_add
+  end note
+}
+
+package "changelog" {
+  class generate_change_log <<function>> {
+    +generate_change_log(control_path: Path): Path
+  }
+}
+
+package "integrate" {
+  class integrate_changes <<function>> {
+    +integrate_changes(control_path: Path,\n  change_log_path: Path,\n  mode: validate_only|apply): Path
+  }
+}
+
+package "audit" {
+  class audit_functions <<functions>> {
+    +setup_audit_logger(output_path, run_id, mode): (Logger, Path)
+    +close_audit_logger(logger): void
+  }
+}
+
+package "utils" {
+  class utils_functions <<functions>> {
+    +generate_run_id(): str
+    +file_hash(path: Path): str
+    +resolve_path(base: Path, path_str: str): Path
+    +yn_to_bool(value): bool
+    +table_stem(filename): str
+  }
+}
+
+ControlConfig "1" *-- "*" ChangeRequestRow
+ControlConfig "1" *-- "*" ColumnRename
+ControlConfig "1" *-- "*" KeyCountApproval
+DiffResult "1" *-- "*" ChangeRow
+
+read_control ..> ControlConfig : creates
+prophet_csv_io ..> ProphetTable : creates / writes
+diff_functions ..> DiffResult : creates
+diff_functions ..> ProphetTable : compares
+diff_functions ..> ControlConfig : reads renames
+generate_change_log ..> read_control : uses
+generate_change_log ..> prophet_csv_io : uses
+generate_change_log ..> diff_functions : uses
+generate_change_log ..> audit_functions : uses
+integrate_changes ..> read_control : uses
+integrate_changes ..> prophet_csv_io : uses
+integrate_changes ..> audit_functions : uses
+integrate_changes ..> utils_functions : uses
+generate_change_log ..> utils_functions : uses
+
+@enduml

@@ -1,0 +1,63 @@
+@startuml prophet_table_tool_packages
+title Prophet Table Change Tool — Package / Component Overview
+skinparam packageStyle rectangle
+skinparam componentStyle rectangle
+skinparam shadowing false
+
+package "prophet_table_tool" {
+  [__main__\nmain()] as CLI
+
+  package "Stage 1" {
+    [changelog\ngenerate_change_log()] as GCL
+  }
+
+  package "Stage 2" {
+    [integrate\nintegrate_changes()] as INT
+  }
+
+  package "Supporting modules" {
+    [control\nControlConfig, read_control] as CTRL
+    [prophet_csv\nProphetTable I/O] as CSV
+    [diff\ndiff_table, detect_conflicts] as DIFF
+    [audit\nsetup_audit_logger] as AUDIT
+    [utils\nhash, run_id, paths] as UTILS
+  }
+}
+
+package "External I/O" {
+  database "Control.xlsx" as CTRLX
+  folder "ChangeRequests/*/before|after/*.csv" as BA
+  folder "Production_Tables/*.csv" as PROD
+  file "Output/ChangeLog_*.xlsx" as CLOG
+  file "Output/IntegrationReport_*.xlsx" as RPT
+  folder "Output/New_Production_Tables/*.csv" as NEW
+  folder "Output/Audit/*.log" as LOGS
+}
+
+CLI --> GCL
+CLI --> INT
+
+GCL --> CTRL
+GCL --> CSV
+GCL --> DIFF
+GCL --> AUDIT
+GCL --> UTILS
+
+INT --> CTRL
+INT --> CSV
+INT --> AUDIT
+INT --> UTILS
+
+GCL --> CTRLX
+GCL --> BA
+GCL --> CLOG
+GCL --> LOGS
+
+INT --> CTRLX
+INT --> CLOG
+INT --> PROD
+INT --> RPT
+INT --> NEW
+INT --> LOGS
+
+@enduml

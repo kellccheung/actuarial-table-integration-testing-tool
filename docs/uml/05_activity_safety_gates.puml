@@ -1,0 +1,61 @@
+@startuml prophet_table_tool_stage2_activity
+title Stage 2 — Validation & Safety Gates
+skinparam shadowing false
+skinparam ActivityBackgroundColor White
+skinparam ActivityBorderColor Black
+
+start
+
+:Load Control.xlsx + ChangeLog_*.xlsx;
+:Filter include=Y AND approved=Y;\nsort by order;
+
+if (Unresolved conflicts?) then (yes + apply)
+  :Hard stop;\nwrite Validation_Report FAIL;
+  stop
+else (no / or validate_only continues)
+endif
+
+:Load Production_Tables into memory;
+
+if (All referenced tables exist\n(except pure table_add)?) then (no)
+  :Hard stop;\nwrite Validation_Report FAIL;
+  stop
+else (yes)
+endif
+
+if (value_update / row_delete:\nkey + old_value exact match?) then (no)
+  :Hard stop;\nmismatched key/value message;
+  stop
+else (yes)
+endif
+
+if (key_count_change present?) then (yes)
+  if (Approved in Control\n/ KeyCountApprovals?) then (no)
+    :Hard stop;\nkey-count blocked;
+    stop
+  else (yes)
+  endif
+else (n/a)
+endif
+
+if (column_rename present?) then (yes)
+  if (Declared in ColumnRenames?) then (no)
+    :Hard stop;\nrename not declared;
+    stop
+  else (yes)
+  endif
+else (n/a)
+endif
+
+if (mode?) then (validate_only)
+  :Write IntegrationReport\nstatus = DRY_RUN_SUCCESS;
+  :Write **zero** files to\nNew_Production_Tables/;
+  stop
+else (apply)
+  :Apply changes sequentially\nin Control.order;
+  :Write New_Production_Tables/\noriginal filenames, !N/* format;
+  :Write IntegrationReport\nstatus = SUCCESS;
+  stop
+endif
+
+@enduml

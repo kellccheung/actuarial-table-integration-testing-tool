@@ -1,0 +1,60 @@
+@startuml prophet_table_tool_stage2_sequence
+title Stage 2 — integrate_changes
+skinparam shadowing false
+autonumber
+
+actor User
+participant "__main__" as CLI
+participant "integrate_changes" as INT
+participant "read_control" as CTRL
+database "ChangeLog_*.xlsx" as CLOG
+participant "prophet_csv" as CSV
+participant "_validate_table_changes" as VAL
+participant "_apply_table_changes" as APP
+folder "New_Production_Tables" as OUT
+database "IntegrationReport_*.xlsx" as RPT
+
+User -> CLI : mode = validate_only | apply
+CLI -> INT : integrate_changes(control,\nchange_log, mode)
+
+INT -> CTRL : read_control(control_path)
+CTRL --> INT : ControlConfig
+
+INT -> CLOG : load ChangeLog_Detail + Conflicts
+note right of INT
+  Filter: include=Y AND approved=Y
+  Sort by Control.order
+end note
+
+alt unresolved conflicts AND mode = apply
+  INT -> RPT : Validation_Report FAIL
+  INT --> CLI : report path (hard stop)
+else continue
+  INT -> CSV : discover + read Production_Tables
+  CSV --> INT : Dict~str, ProphetTable~
+
+  loop each approved CR × table
+    INT -> VAL : validate change rows\nvs production
+    VAL --> INT : ok / failure messages
+  end
+
+  alt validation failed
+    INT -> RPT : FAIL\n(never write tables)
+    INT --> CLI : report path
+  else mode = validate_only
+    INT -> RPT : DRY_RUN_SUCCESS\n(zero table writes)
+    INT --> CLI : report path
+  else mode = apply
+    loop CR order × tables
+      INT -> APP : apply change rows
+      APP --> INT : updated ProphetTable
+    end
+    INT -> OUT : write_prophet_csv\n(!N / * preserved,\noriginal filenames)
+    INT -> RPT : SUCCESS
+    INT --> CLI : report path
+  end
+end
+
+CLI --> User : Integration Report path
+
+@enduml

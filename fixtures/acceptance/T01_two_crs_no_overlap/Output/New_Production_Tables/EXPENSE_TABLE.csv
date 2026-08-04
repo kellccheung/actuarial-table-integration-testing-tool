@@ -1,0 +1,4 @@
+!3,Product,ExpenseType,Amount
+*,PROD_A,ACQ,110
+*,PROD_A,MAINT,50
+*,PROD_B,ACQ,120

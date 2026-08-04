@@ -1,0 +1,48 @@
+@startuml prophet_table_tool_stage1_sequence
+title Stage 1 — generate_change_log
+skinparam shadowing false
+autonumber
+
+actor User
+participant "__main__" as CLI
+participant "generate_change_log" as GCL
+participant "read_control" as CTRL
+participant "audit" as AUDIT
+participant "prophet_csv" as CSV
+participant "diff_table" as DIFF
+participant "detect_conflicts" as CONF
+database "ChangeLog_*.xlsx" as XLSX
+
+User -> CLI : mode = generate_changelog
+CLI -> GCL : generate_change_log(control_path)
+
+GCL -> CTRL : read_control(control_path)
+CTRL --> GCL : ControlConfig
+
+GCL -> AUDIT : setup_audit_logger(output, run_id, mode)
+
+loop each included ChangeRequest (sorted by order)
+  GCL -> CSV : discover_csv_tables(before/)
+  GCL -> CSV : discover_csv_tables(after/)
+
+  alt empty CR folder (no CSVs)
+    GCL -> AUDIT : warning; Summary status = EMPTY
+  else table only in before/
+    GCL -> AUDIT : warning + skip\n(no change rows)
+  else table in both, or only in after/
+    GCL -> CSV : read_prophet_csv(before?) 
+    GCL -> CSV : read_prophet_csv(after?)
+    GCL -> DIFF : diff_table(cr_id, table,\nbefore, after, control)
+    DIFF --> GCL : DiffResult (ChangeRows)
+  end
+end
+
+GCL -> CONF : detect_conflicts(all ChangeRows)
+CONF --> GCL : Conflicts list
+
+GCL -> XLSX : write Summary\nChangeLog_Detail\nConflicts
+GCL -> AUDIT : control/change_log hashes\nfinal_status = SUCCESS
+GCL --> CLI : Path to ChangeLog_*.xlsx
+CLI --> User : Change Log path
+
+@enduml

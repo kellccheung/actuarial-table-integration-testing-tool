@@ -1,0 +1,23 @@
+@startuml prophet_table_tool_overview
+title Prophet Table Change Tool — All Diagrams Index
+skinparam shadowing false
+
+note as N1
+  **PlantUML diagram set**
+  ----
+  01_packages.puml
+    Package / component overview
+  02_classes.puml
+    Class model (dataclasses + modules)
+  03_sequence_stage1.puml
+    Stage 1 generate_change_log
+  04_sequence_stage2.puml
+    Stage 2 integrate_changes
+  05_activity_safety_gates.puml
+    Stage 2 validation / safety gates
+  ----
+  Render with PlantUML CLI or an IDE plugin, e.g.:
+    java -jar plantuml.jar docs/uml/*.puml
+end note
+
+@enduml

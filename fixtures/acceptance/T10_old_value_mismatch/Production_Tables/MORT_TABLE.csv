@@ -1,0 +1,4 @@
+!4,Age,Duration,Product,Rate,Loading
+*,20,1,PROD_A,0.0099,1.05
+*,25,1,PROD_A,0.0015,1.05
+*,30,1,PROD_B,0.0020,1.10

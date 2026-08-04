@@ -8,6 +8,7 @@ Requires fixtures under fixtures/acceptance/ (run build script first):
 
 from __future__ import annotations
 
+import csv
 import shutil
 from pathlib import Path
 
@@ -51,6 +52,15 @@ def _sheet_rows(xlsx: Path, sheet: str) -> list[dict]:
     return result
 
 
+def _detail_rows(clog: Path) -> list[dict]:
+    """Load ChangeLog detail from sidecar CSV (or Excel fallback)."""
+    detail_csv = clog.with_name(f"{clog.stem}_Detail.csv")
+    if detail_csv.is_file():
+        with detail_csv.open("r", encoding="utf-8", newline="") as f:
+            return list(csv.DictReader(f))
+    return _sheet_rows(clog, "ChangeLog_Detail")
+
+
 def _read_text(path: Path) -> str:
     return path.read_text(encoding="utf-8").replace("\r\n", "\n").strip()
 
@@ -63,21 +73,16 @@ def _assert_csv_equal(actual: Path, expected: Path) -> None:
     )
 
 
-# ---------------------------------------------------------------------------
-# T01
-# ---------------------------------------------------------------------------
-
 def test_t01_two_crs_no_overlap():
     case = _case("T01_two_crs_no_overlap")
     _clean_output(case)
 
     clog = generate_change_log(case / "Control.xlsx")
-    detail = _sheet_rows(clog, "ChangeLog_Detail")
+    detail = _detail_rows(clog)
     conflicts = _sheet_rows(clog, "Conflicts")
     assert conflicts == [] or all(
         not r.get("conflict_type") for r in conflicts
     ) or len(conflicts) == 0
-    # No conflicts sheet rows with content
     assert not any(r.get("conflict_type") for r in conflicts)
 
     types = {r["change_type"] for r in detail}
@@ -85,8 +90,8 @@ def test_t01_two_crs_no_overlap():
     assert "CR_T01_Mortality" in {r["change_request_id"] for r in detail}
     assert "CR_T01_Expense" in {r["change_request_id"] for r in detail}
 
-    # Per-table human review sheets (ignored by Stage 2)
     wb_clog = load_workbook(clog, data_only=True)
+    assert "ChangeLog_Detail" not in wb_clog.sheetnames
     assert "MORT_TABLE" in wb_clog.sheetnames
     assert "EXPENSE_TABLE" in wb_clog.sheetnames
     mort_rows = list(wb_clog["MORT_TABLE"].iter_rows(values_only=True))
@@ -115,10 +120,6 @@ def test_t01_two_crs_no_overlap():
     _assert_csv_equal(out / "EXPENSE_TABLE.csv", case / "expected" / "EXPENSE_TABLE.csv")
 
 
-# ---------------------------------------------------------------------------
-# T02
-# ---------------------------------------------------------------------------
-
 def test_t02_same_cell_conflict():
     case = _case("T02_same_cell_conflict")
     _clean_output(case)
@@ -136,16 +137,12 @@ def test_t02_same_cell_conflict():
     assert not new_dir.exists() or list(new_dir.glob("*.csv")) == []
 
 
-# ---------------------------------------------------------------------------
-# T03
-# ---------------------------------------------------------------------------
-
 def test_t03_before_only_table():
     case = _case("T03_before_only_table")
     _clean_output(case)
 
     clog = generate_change_log(case / "Control.xlsx")
-    detail = _sheet_rows(clog, "ChangeLog_Detail")
+    detail = _detail_rows(clog)
     assert not any(r.get("table_name") == "OBSOLETE_TABLE" for r in detail)
     assert any(r.get("table_name") == "MORT_TABLE" for r in detail)
 
@@ -156,16 +153,12 @@ def test_t03_before_only_table():
     assert "only in before" in text.lower() or "skipped" in text.lower()
 
 
-# ---------------------------------------------------------------------------
-# T04
-# ---------------------------------------------------------------------------
-
 def test_t04_table_add():
     case = _case("T04_after_only_table_add")
     _clean_output(case)
 
     clog = generate_change_log(case / "Control.xlsx")
-    detail = _sheet_rows(clog, "ChangeLog_Detail")
+    detail = _detail_rows(clog)
     assert any(r.get("change_type") == "table_add" for r in detail)
     assert any(r.get("table_name") == "NEW_LOADING_TABLE" for r in detail)
 
@@ -177,16 +170,12 @@ def test_t04_table_add():
     assert (out / "MORT_TABLE.csv").exists()
 
 
-# ---------------------------------------------------------------------------
-# T05
-# ---------------------------------------------------------------------------
-
 def test_t05_column_rename_declared():
     case = _case("T05_column_rename_declared")
     _clean_output(case)
 
     clog = generate_change_log(case / "Control.xlsx")
-    detail = _sheet_rows(clog, "ChangeLog_Detail")
+    detail = _detail_rows(clog)
     assert any(r.get("change_type") == "column_rename" for r in detail)
 
     integrate_changes(case / "Control.xlsx", clog, "apply")
@@ -197,20 +186,14 @@ def test_t05_column_rename_declared():
     _assert_csv_equal(out_csv, case / "expected" / "MORT_TABLE.csv")
 
 
-# ---------------------------------------------------------------------------
-# T06
-# ---------------------------------------------------------------------------
-
 def test_t06_column_rename_undeclared():
     case = _case("T06_column_rename_undeclared")
     _clean_output(case)
 
-    # Stage 1 with declared rename → ChangeLog contains column_rename
     clog = generate_change_log(case / "Control.xlsx")
-    detail = _sheet_rows(clog, "ChangeLog_Detail")
+    detail = _detail_rows(clog)
     assert any(r.get("change_type") == "column_rename" for r in detail)
 
-    # Stage 2 with Control_stage2 (no ColumnRenames) → hard stop
     report = integrate_changes(case / "Control_stage2.xlsx", clog, "apply")
     msgs = _sheet_rows(report, "Validation_Report")
     assert any(
@@ -223,16 +206,12 @@ def test_t06_column_rename_undeclared():
     assert not new_dir.exists() or list(new_dir.glob("*.csv")) == []
 
 
-# ---------------------------------------------------------------------------
-# T07
-# ---------------------------------------------------------------------------
-
 def test_t07_key_count_approved():
     case = _case("T07_key_count_approved")
     _clean_output(case)
 
     clog = generate_change_log(case / "Control.xlsx")
-    detail = _sheet_rows(clog, "ChangeLog_Detail")
+    detail = _detail_rows(clog)
     assert any(r.get("change_type") == "key_count_change" for r in detail)
 
     report = integrate_changes(case / "Control.xlsx", clog, "apply")
@@ -247,10 +226,6 @@ def test_t07_key_count_approved():
     _assert_csv_equal(out_csv, case / "expected" / "MORT_TABLE.csv")
 
 
-# ---------------------------------------------------------------------------
-# T08
-# ---------------------------------------------------------------------------
-
 def test_t08_key_count_not_approved():
     case = _case("T08_key_count_not_approved")
     _clean_output(case)
@@ -258,7 +233,7 @@ def test_t08_key_count_not_approved():
     clog = generate_change_log(case / "Control.xlsx")
     assert any(
         r.get("change_type") == "key_count_change"
-        for r in _sheet_rows(clog, "ChangeLog_Detail")
+        for r in _detail_rows(clog)
     )
 
     report = integrate_changes(case / "Control.xlsx", clog, "apply")
@@ -270,10 +245,6 @@ def test_t08_key_count_not_approved():
     new_dir = case / "Output" / "New_Production_Tables"
     assert not new_dir.exists() or list(new_dir.glob("*.csv")) == []
 
-
-# ---------------------------------------------------------------------------
-# T09
-# ---------------------------------------------------------------------------
 
 def test_t09_validate_only():
     case = _case("T09_validate_only")
@@ -290,27 +261,22 @@ def test_t09_validate_only():
     assert not new_dir.exists() or list(new_dir.glob("*.csv")) == []
 
 
-# ---------------------------------------------------------------------------
-# T10
-# ---------------------------------------------------------------------------
-
-def test_t10_old_value_mismatch():
+def test_t10_old_value_mismatch_still_applies():
+    """Production may differ from Change Log old_value; apply still succeeds."""
     case = _case("T10_old_value_mismatch")
     _clean_output(case)
 
     clog = generate_change_log(case / "Control.xlsx")
     report = integrate_changes(case / "Control.xlsx", clog, "apply")
-    msgs = _sheet_rows(report, "Validation_Report")
-    assert any("old_value mismatch" in str(m.get("message", "")).lower() for m in msgs)
-    assert any("20|1|PROD_A" in str(m.get("key_tuple", "")) for m in msgs)
     wb = load_workbook(report, data_only=True)
-    assert wb["Summary"]["B1"].value == "FAILED"
+    assert wb["Summary"]["B1"].value == "SUCCESS"
     wb.close()
 
+    out_csv = case / "Output" / "New_Production_Tables" / "MORT_TABLE.csv"
+    text = _read_text(out_csv)
+    # new_value from change log (0.0013) is applied even though prod had 0.0099
+    assert "*,20,1,PROD_A,0.0013,1.05" in text
 
-# ---------------------------------------------------------------------------
-# T11
-# ---------------------------------------------------------------------------
 
 def test_t11_idempotent_apply():
     case = _case("T11_idempotent_apply")
@@ -318,13 +284,14 @@ def test_t11_idempotent_apply():
 
     clog = generate_change_log(case / "Control.xlsx")
     clog_keep = case / "ChangeLog_kept.xlsx"
+    detail_keep = case / "ChangeLog_kept_Detail.csv"
     shutil.copy(clog, clog_keep)
+    shutil.copy(clog.with_name(f"{clog.stem}_Detail.csv"), detail_keep)
 
     integrate_changes(case / "Control.xlsx", clog_keep, "apply")
     out = case / "Output" / "New_Production_Tables"
     first = {p.name: _read_text(p) for p in out.glob("*.csv")}
 
-    # Clear outputs only; re-apply same Change Log onto the same production snapshot
     shutil.rmtree(out)
     integrate_changes(case / "Control.xlsx", clog_keep, "apply")
     second = {
@@ -339,10 +306,6 @@ def test_t11_idempotent_apply():
     )
 
 
-# ---------------------------------------------------------------------------
-# T12
-# ---------------------------------------------------------------------------
-
 def test_t12_empty_change_request():
     case = _case("T12_empty_change_request")
     _clean_output(case)
@@ -352,5 +315,5 @@ def test_t12_empty_change_request():
     assert len(summary) == 1
     assert summary[0]["change_request_id"] == "CR_T12_Empty"
     assert summary[0]["status"] == "EMPTY"
-    detail = _sheet_rows(clog, "ChangeLog_Detail")
+    detail = _detail_rows(clog)
     assert detail == []

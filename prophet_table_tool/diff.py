@@ -7,7 +7,8 @@ from dataclasses import dataclass, field
 import polars as pl
 
 from .control import ControlConfig
-from .prophet_csv import ProphetTable
+from .prophet_csv import ProphetTable, with_normalized_keys
+from .utils import format_normalized_key
 
 
 CHANGE_TYPES = (
@@ -44,9 +45,20 @@ class DiffResult:
 
 
 def format_key_tuple(values: list | tuple | None) -> str:
-    if values is None:
-        return ""
-    return "|".join("" if v is None else str(v) for v in values)
+    """Pipe-join key parts with numeric normalization (same as Stage 1/2 keys)."""
+    return format_normalized_key(values)
+
+
+def _cells_differ_expr(old_col: str, new_col: str) -> pl.Expr:
+    """True when old/new are not equal as strings and not equal as floats."""
+    old_s = pl.col(old_col).cast(pl.Utf8).fill_null("")
+    new_s = pl.col(new_col).cast(pl.Utf8).fill_null("")
+    old_f = old_s.cast(pl.Float64, strict=False)
+    new_f = new_s.cast(pl.Float64, strict=False)
+    both_numeric = old_f.is_not_null() & new_f.is_not_null() & (old_s != "") & (new_s != "")
+    numeric_eq = both_numeric & (old_f == new_f)
+    string_eq = old_s == new_s
+    return ~(string_eq | numeric_eq)
 
 
 def diff_table(
@@ -59,9 +71,8 @@ def diff_table(
     """
     Compute detailed changes between before and after for one table.
 
-    - after only  → table_add
-    - before only → warning + skip (caller should not call with after=None only;
-      but we still handle it defensively)
+    Value comparison is numeric-aware (``1.10`` == ``1.1``). Keys are joined
+    after the same numeric normalization.
     """
     result = DiffResult()
 
@@ -84,25 +95,18 @@ def diff_table(
                 notes="Table only present in after/",
             )
         )
-        # Also emit row_add for each row so Stage 2 can rebuild the table
-        after_keyed = after.with_key_tuple()
-        for row in after_keyed.iter_rows(named=True):
-            key_str = format_key_tuple(row["_key_tuple"])
-            for col in after.columns:
-                result.change_rows.append(
-                    ChangeRow(
-                        change_request_id=change_request_id,
-                        table_name=table_name,
-                        change_type="row_add",
-                        n_keys_before=None,
-                        n_keys_after=after.n_keys,
-                        key_tuple=key_str,
-                        column_name=col,
-                        old_value="",
-                        new_value="" if row[col] is None else str(row[col]),
-                        notes="Part of table_add",
-                    )
-                )
+        _emit_row_cell_changes(
+            result,
+            change_request_id=change_request_id,
+            table_name=table_name,
+            change_type="row_add",
+            n_keys_before=None,
+            n_keys_after=after.n_keys,
+            keyed=with_normalized_keys(after.data, after.key_columns),
+            columns=after.columns,
+            value_from="new",
+            notes="Part of table_add",
+        )
         return result
 
     if before is not None and after is None:
@@ -154,17 +158,13 @@ def diff_table(
             )
         )
 
-    # Normalize before columns through renames for comparison
-    before_cols_mapped = [
-        rename_old_to_new.get(c, c) for c in before.columns
-    ]
+    before_cols_mapped = [rename_old_to_new.get(c, c) for c in before.columns]
     after_cols = list(after.columns)
 
     before_set = set(before_cols_mapped)
     after_set = set(after_cols)
 
     for col in sorted(after_set - before_set):
-        # Skip if this is the new name of a declared rename
         if col in rename_new_to_old:
             continue
         result.change_rows.append(
@@ -203,60 +203,42 @@ def diff_table(
             )
         )
 
-    # --- Row / value diffs (exact string match on key tuples) ---
     # Align before schema to after names via renames for value comparison
     before_aligned = before.data
-    rename_exprs = [
-        pl.col(old).alias(new)
-        for old, new in rename_old_to_new.items()
-        if old in before_aligned.columns
-    ]
-    if rename_exprs:
+    if rename_old_to_new:
         before_aligned = before_aligned.rename(
             {old: new for old, new in rename_old_to_new.items() if old in before_aligned.columns}
         )
 
-    # Use after key columns for matching when key count changed;
-    # otherwise use the (possibly renamed) before key columns.
     if before.n_keys == after.n_keys:
         key_cols = after.key_columns
     else:
-        # Structural change: still attempt match on overlapping key columns
         key_cols = [c for c in after.key_columns if c in before_aligned.columns]
         if not key_cols:
-            # Cannot match rows — structural only; skip row-level diff
             return result
 
     common_value_cols = [
-        c
-        for c in after.columns
-        if c in before_aligned.columns and c not in key_cols
+        c for c in after.columns if c in before_aligned.columns and c not in key_cols
     ]
 
     before_df = before_aligned
     after_df = after.data
 
-    def with_keys(df: pl.DataFrame, cols: list[str]) -> pl.DataFrame:
-        if not cols:
-            return df.with_columns(
-                pl.lit("").alias("_key_str"),
-                pl.lit([]).cast(pl.List(pl.Utf8)).alias("_key_tuple"),
-            )
-        return df.with_columns(
-            pl.concat_list([pl.col(c).cast(pl.Utf8) for c in cols]).alias("_key_tuple"),
-            pl.concat_str([pl.col(c).cast(pl.Utf8) for c in cols], separator="|").alias(
-                "_key_str"
-            ),
-        )
-
-    # Only keep columns we need
     before_keep = [c for c in key_cols + common_value_cols if c in before_df.columns]
-    after_keep = [c for c in key_cols + common_value_cols + [
-        c for c in after.columns if c not in before_aligned.columns and c not in key_cols
-    ] if c in after_df.columns]
+    after_extra = [
+        c
+        for c in after.columns
+        if c not in before_aligned.columns and c not in key_cols
+    ]
+    after_keep = [
+        c
+        for c in key_cols + common_value_cols + after_extra
+        if c in after_df.columns
+    ]
+    after_keep = list(dict.fromkeys(after_keep))
 
-    b = with_keys(before_df.select(before_keep), key_cols)
-    a = with_keys(after_df.select(list(dict.fromkeys(after_keep))), key_cols)
+    b = with_normalized_keys(before_df.select(before_keep), key_cols)
+    a = with_normalized_keys(after_df.select(after_keep), key_cols)
 
     b_keys = set(b["_key_str"].to_list())
     a_keys = set(a["_key_str"].to_list())
@@ -265,58 +247,41 @@ def diff_table(
     deleted_keys = b_keys - a_keys
     common_keys = b_keys & a_keys
 
-    # Row adds
     if added_keys:
         a_add = a.filter(pl.col("_key_str").is_in(list(added_keys)))
-        for row in a_add.iter_rows(named=True):
-            key_str = row["_key_str"]
-            for col in after.columns:
-                if col not in row:
-                    continue
-                result.change_rows.append(
-                    ChangeRow(
-                        change_request_id=change_request_id,
-                        table_name=table_name,
-                        change_type="row_add",
-                        n_keys_before=before.n_keys,
-                        n_keys_after=after.n_keys,
-                        key_tuple=key_str,
-                        column_name=col,
-                        old_value="",
-                        new_value="" if row[col] is None else str(row[col]),
-                        notes="",
-                    )
-                )
+        _emit_row_cell_changes(
+            result,
+            change_request_id=change_request_id,
+            table_name=table_name,
+            change_type="row_add",
+            n_keys_before=before.n_keys,
+            n_keys_after=after.n_keys,
+            keyed=a_add,
+            columns=after.columns,
+            value_from="new",
+            notes="",
+        )
 
-    # Row deletes
     if deleted_keys:
         b_del = b.filter(pl.col("_key_str").is_in(list(deleted_keys)))
-        for row in b_del.iter_rows(named=True):
-            key_str = row["_key_str"]
-            for col in before_aligned.columns:
-                if col not in row:
-                    continue
-                result.change_rows.append(
-                    ChangeRow(
-                        change_request_id=change_request_id,
-                        table_name=table_name,
-                        change_type="row_delete",
-                        n_keys_before=before.n_keys,
-                        n_keys_after=after.n_keys,
-                        key_tuple=key_str,
-                        column_name=col,
-                        old_value="" if row[col] is None else str(row[col]),
-                        new_value="",
-                        notes="",
-                    )
-                )
+        _emit_row_cell_changes(
+            result,
+            change_request_id=change_request_id,
+            table_name=table_name,
+            change_type="row_delete",
+            n_keys_before=before.n_keys,
+            n_keys_after=after.n_keys,
+            keyed=b_del,
+            columns=list(before_aligned.columns),
+            value_from="old",
+            notes="",
+        )
 
-    # Value updates on common keys
+    # Value updates on common keys (vectorized numeric-aware compare)
     if common_keys and common_value_cols:
-        b_common = b.filter(pl.col("_key_str").is_in(list(common_keys))).sort("_key_str")
-        a_common = a.filter(pl.col("_key_str").is_in(list(common_keys))).sort("_key_str")
+        b_common = b.filter(pl.col("_key_str").is_in(list(common_keys)))
+        a_common = a.filter(pl.col("_key_str").is_in(list(common_keys)))
 
-        # Join on key for comparison
         joined = b_common.select(
             ["_key_str"] + [pl.col(c).alias(f"old_{c}") for c in common_value_cols]
         ).join(
@@ -327,46 +292,19 @@ def diff_table(
             how="inner",
         )
 
-        for row in joined.iter_rows(named=True):
-            key_str = row["_key_str"]
-            for col in common_value_cols:
-                old_v = row[f"old_{col}"]
-                new_v = row[f"new_{col}"]
-                old_s = "" if old_v is None else str(old_v)
-                new_s = "" if new_v is None else str(new_v)
-                if old_s != new_s:
-                    result.change_rows.append(
-                        ChangeRow(
-                            change_request_id=change_request_id,
-                            table_name=table_name,
-                            change_type="value_update",
-                            n_keys_before=before.n_keys,
-                            n_keys_after=after.n_keys,
-                            key_tuple=key_str,
-                            column_name=col,
-                            old_value=old_s,
-                            new_value=new_s,
-                            notes="",
-                        )
-                    )
-
-    # Newly added columns: emit value fills for existing keys as value_update? 
-    # Spec says column_add is enough structurally; values on new cols for existing
-    # rows are captured if we treat them as value_update from empty.
-    new_cols = [
-        c for c in after.columns
-        if c not in before_aligned.columns and c not in rename_new_to_old.values()
-        or (c not in before_aligned.columns and c not in key_cols)
-    ]
-    # Cleaner:
-    genuinely_new_cols = [c for c in after.columns if c not in before_aligned.columns]
-    if genuinely_new_cols and common_keys:
-        a_common = a.filter(pl.col("_key_str").is_in(list(common_keys)))
-        for row in a_common.iter_rows(named=True):
-            key_str = row["_key_str"]
-            for col in genuinely_new_cols:
-                if col not in row:
-                    continue
+        for col in common_value_cols:
+            old_alias = f"old_{col}"
+            new_alias = f"new_{col}"
+            diffs = joined.filter(_cells_differ_expr(old_alias, new_alias)).select(
+                [
+                    pl.col("_key_str"),
+                    pl.col(old_alias).cast(pl.Utf8).fill_null("").alias("old_value"),
+                    pl.col(new_alias).cast(pl.Utf8).fill_null("").alias("new_value"),
+                ]
+            )
+            if diffs.is_empty():
+                continue
+            for key_str, old_s, new_s in diffs.iter_rows():
                 result.change_rows.append(
                     ChangeRow(
                         change_request_id=change_request_id,
@@ -376,25 +314,88 @@ def diff_table(
                         n_keys_after=after.n_keys,
                         key_tuple=key_str,
                         column_name=col,
-                        old_value="",
-                        new_value="" if row[col] is None else str(row[col]),
-                        notes="Value on newly added column",
+                        old_value=old_s,
+                        new_value=new_s,
+                        notes="",
                     )
                 )
 
+    genuinely_new_cols = [c for c in after.columns if c not in before_aligned.columns]
+    if genuinely_new_cols and common_keys:
+        a_common = a.filter(pl.col("_key_str").is_in(list(common_keys)))
+        _emit_row_cell_changes(
+            result,
+            change_request_id=change_request_id,
+            table_name=table_name,
+            change_type="value_update",
+            n_keys_before=before.n_keys,
+            n_keys_after=after.n_keys,
+            keyed=a_common,
+            columns=genuinely_new_cols,
+            value_from="new",
+            notes="Value on newly added column",
+            force_old_empty=True,
+        )
+
     return result
+
+
+def _emit_row_cell_changes(
+    result: DiffResult,
+    *,
+    change_request_id: str,
+    table_name: str,
+    change_type: str,
+    n_keys_before: int | None,
+    n_keys_after: int | None,
+    keyed: pl.DataFrame,
+    columns: list[str],
+    value_from: str,
+    notes: str,
+    force_old_empty: bool = False,
+) -> None:
+    """Emit one ChangeRow per cell for row_add / row_delete / new-column fills."""
+    present_cols = [c for c in columns if c in keyed.columns]
+    if not present_cols or keyed.is_empty():
+        return
+
+    for row in keyed.select(["_key_str"] + present_cols).iter_rows(named=True):
+        key_str = row["_key_str"]
+        for col in present_cols:
+            cell = row[col]
+            val = "" if cell is None else str(cell)
+            if force_old_empty:
+                old_v, new_v = "", val
+            elif value_from == "new":
+                old_v, new_v = "", val
+            else:
+                old_v, new_v = val, ""
+            result.change_rows.append(
+                ChangeRow(
+                    change_request_id=change_request_id,
+                    table_name=table_name,
+                    change_type=change_type,
+                    n_keys_before=n_keys_before,
+                    n_keys_after=n_keys_after,
+                    key_tuple=key_str,
+                    column_name=col,
+                    old_value=old_v,
+                    new_value=new_v,
+                    notes=notes,
+                )
+            )
 
 
 def detect_conflicts(change_rows: list[ChangeRow]) -> list[dict]:
     """
     Detect conflicts across change requests:
     same table + same key + same column with differing changes,
-    or structural collisions (key_count / column changes) on the same table
-    from different CRs.
+    structural collisions (key_count / column changes) on the same table
+    from different CRs, or missing fills where a row_add and column_add
+    leave their intersection cell without a Change Log value.
     """
     conflicts: list[dict] = []
 
-    # Cell-level overlaps: (table, key_tuple, column) touched by >1 CR
     cell_index: dict[tuple[str, str, str], list[ChangeRow]] = {}
     for row in change_rows:
         if row.change_type not in {"value_update", "row_add", "row_delete"}:
@@ -408,10 +409,12 @@ def detect_conflicts(change_rows: list[ChangeRow]) -> list[dict]:
         cr_ids = {r.change_request_id for r in rows}
         if len(cr_ids) < 2:
             continue
-        # Conflict if values disagree or multiple CRs touch same cell
         new_vals = {r.new_value for r in rows}
         old_vals = {r.old_value for r in rows}
         types = {r.change_type for r in rows}
+        # Numeric-aware: if all new_values are pairwise equal numerically, still flag
+        # multi-CR overlap (process conflict) — keep existing behavior of flagging
+        # any multi-CR touch.
         conflicts.append(
             {
                 "conflict_type": "cell_overlap",
@@ -427,7 +430,6 @@ def detect_conflicts(change_rows: list[ChangeRow]) -> list[dict]:
             }
         )
 
-    # Structural collisions on same table from different CRs
     structural_types = {
         "key_count_change",
         "column_add",
@@ -444,7 +446,6 @@ def detect_conflicts(change_rows: list[ChangeRow]) -> list[dict]:
         cr_ids = {r.change_request_id for r in rows}
         if len(cr_ids) < 2:
             continue
-        # Flag if two CRs both change structure of same table
         by_cr: dict[str, list[ChangeRow]] = {}
         for r in rows:
             by_cr.setdefault(r.change_request_id, []).append(r)
@@ -463,5 +464,58 @@ def detect_conflicts(change_rows: list[ChangeRow]) -> list[dict]:
                     "resolved": "N",
                 }
             )
+
+    # row_add × column_add intersection with no covering value in the Change Log
+    by_table: dict[str, list[ChangeRow]] = {}
+    for row in change_rows:
+        by_table.setdefault(row.table_name, []).append(row)
+
+    for table, rows in by_table.items():
+        added_cols = {
+            r.column_name: r.change_request_id
+            for r in rows
+            if r.change_type == "column_add" and r.column_name
+        }
+        if not added_cols:
+            continue
+
+        added_key_crs: dict[str, set[str]] = {}
+        for r in rows:
+            if r.change_type == "row_add" and r.key_tuple:
+                added_key_crs.setdefault(r.key_tuple, set()).add(r.change_request_id)
+        if not added_key_crs:
+            continue
+
+        covered = {
+            (r.key_tuple, r.column_name)
+            for r in rows
+            if r.change_type in {"row_add", "value_update"}
+            and r.key_tuple
+            and r.column_name
+        }
+
+        for key_tuple, row_crs in sorted(added_key_crs.items()):
+            for col, col_cr in sorted(added_cols.items()):
+                if (key_tuple, col) in covered:
+                    continue
+                cr_ids = sorted(row_crs | {col_cr})
+                conflicts.append(
+                    {
+                        "conflict_type": "missing_row_column_fill",
+                        "table_name": table,
+                        "key_tuple": key_tuple,
+                        "column_name": col,
+                        "change_request_ids": cr_ids,
+                        "change_types": ["column_add", "row_add"],
+                        "old_values": [],
+                        "new_values": [],
+                        "notes": (
+                            "Row add + column add leave this cell without a value; "
+                            "add a Detail value_update (or row_add cell) or set "
+                            "resolved=Y if blank is intentional"
+                        ),
+                        "resolved": "N",
+                    }
+                )
 
     return conflicts

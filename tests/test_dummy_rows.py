@@ -114,6 +114,19 @@ def test_discover_prefers_fac_over_csv(tmp_path: Path):
     assert found["EXPENSE_TABLE"].suffix.lower() == ".csv"
 
 
+def test_discover_recursive_prefers_fac(tmp_path: Path):
+    sub = tmp_path / "Nested"
+    sub.mkdir()
+    (sub / "MORT_TABLE.csv").write_text(
+        "!4,Age,Duration,Product,Rate,Loading\n*,20,1,PROD_A,0.0012,1.05\n",
+        encoding="utf-8",
+    )
+    (sub / "MORT_TABLE.FAC").write_text(SAMPLE_FAC, encoding="utf-8")
+    found = discover_csv_tables(tmp_path)
+    assert set(found) == {"Nested/MORT_TABLE"}
+    assert found["Nested/MORT_TABLE"].suffix.lower() == ".fac"
+
+
 def test_read_plain_csv_without_dummies_still_works(tmp_path: Path):
     path = tmp_path / "MORT_TABLE.csv"
     path.write_text(

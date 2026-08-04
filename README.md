@@ -153,29 +153,34 @@ If this sheet has no row for a table, the tool falls back to the CR-level `appro
 
 ### Stage 1 — Generate Change Log
 
-Compares `before/` vs `after/` for every included change request and writes:
+Compares `before/` vs `after/` for every included change request (including
+tables in **subfolders**; identity is the relative path, e.g. `SubA/MORT_TABLE`)
+and writes:
 
-`Output/ChangeLog_<run_id>.xlsx`
+- `Output/ChangeLog_<run_id>.xlsx` — Summary, Conflicts, and per-table review sheets
+- `Output/ChangeLog_<run_id>_Detail.csv` — machine-readable change rows used by Stage 2
 
-Sheets include:
+Workbook sheets:
 
 - **Summary** — per-CR counts and conflict flags
-- **ChangeLog_Detail** — row-level changes (`value_update`, `row_add`, `row_delete`, `column_add`, `column_delete`, `column_rename`, `key_count_change`, `table_add`); used by Stage 2
-- **Conflicts** — overlapping updates across CRs (same table + key + column, or structural collisions)
-- **One sheet per touched table** (e.g. `MORT_TABLE`) — human review only: Prophet-shaped wide layout with `_change` markers, `old -> new` in changed cells, and structural notes above the table. Stage 2 ignores these sheets.
+- **Conflicts** — overlapping updates across CRs (same table + key + column, structural collisions, or missing row×column fills)
+- **One sheet per touched table** — human review only (changed rows); Stage 2 ignores these sheets
+
+Value comparison is **numeric-aware** (`1.10` equals `1.1`). CSV files are read
+with encoding fallback: utf-8-sig → utf-8 → cp1252 → latin-1.
 
 ```bash
 python -m prophet_table_tool WorkingRoot\Control.xlsx --mode generate_changelog
 ```
 
-**Review the Change Log before continuing.** Prefer the per-table review tabs for visual checks; use `ChangeLog_Detail` / `Conflicts` for the machine-readable record. If the Conflicts sheet has rows, resolve them (edit the detail / mark resolution as your process requires) before applying.
+**Review the Change Log before continuing.** Prefer the per-table review tabs for visual checks; use the Detail CSV / Conflicts for the machine-readable record. If the Conflicts sheet has rows, resolve them before applying.
 
 ### Stage 2 — Validate only (dry run)
 
 Checks that the Change Log can be applied cleanly against current production:
 
 - Referenced tables exist (except pure `table_add`)
-- `value_update` / `row_delete` match current keys and `old_value`
+- `value_update` / `row_delete` keys exist in production (`old_value` is not required to match)
 - Column renames are declared; key-count changes are approved
 - No unresolved conflicts
 
@@ -221,7 +226,7 @@ Each audit log records timestamp, mode, Control/Change Log hashes, CRs processed
 | Unresolved conflicts in Change Log | Hard stop in `apply` |
 | Key-count change without approval | Hard stop |
 | Column rename not listed in `ColumnRenames` | Hard stop |
-| Production value ≠ Change Log `old_value` | Validation fails |
+| Production value ≠ Change Log `old_value` | Allowed — `new_value` is still applied |
 | Table only in `before/` | Warning + skip (no auto-delete) |
 | `validate_only` | Never writes new production tables |
 
@@ -266,7 +271,7 @@ Detailed behaviour and acceptance cases (T01–T12) are documented in [`Prophet_
 | `--change-log is required` / no Change Log found | Stage 2 needs a `ChangeLog_*.xlsx` in `Output\` (run Stage 1 first); CLI needs `--change-log` |
 | Change request not processed | Folder name = `change_request_id`; Stage 2 needs `include=Y` **and** `approved=Y` |
 | Empty Change Log for a table | Confirm CSVs are under `before/` and `after/` with matching names |
-| Apply refused after conflict | Open Change Log **Conflicts** sheet and resolve overlapping CRs |
+| Apply refused after conflict | Open Change Log **Conflicts** sheet; for overlaps drop/edit the losing Detail rows or exclude a CR; for `missing_row_column_fill` add a Detail value (or set `resolved=Y` if blank is intentional) |
 | Rename / key-count hard stop | Fill `ColumnRenames` or `KeyCountApprovals` (or CR `approved`) |
 
 For design-level detail (change types, conflict rules, developer checklist), see the function documentation linked above.

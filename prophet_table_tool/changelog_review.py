@@ -9,7 +9,7 @@ from openpyxl.styles import Font, PatternFill
 from openpyxl.workbook.workbook import Workbook
 from openpyxl.worksheet.worksheet import Worksheet
 
-from .diff import ChangeRow, format_key_tuple
+from .diff import ChangeRow
 from .prophet_csv import ProphetTable
 
 STRUCTURAL_TYPES = frozenset(
@@ -25,6 +25,16 @@ STRUCTURAL_TYPES = frozenset(
 RESERVED_SHEET_NAMES = frozenset({"Summary", "ChangeLog_Detail", "Conflicts"})
 
 _CHANGE_COL = "_change"
+
+
+def _changed_keys_from_rows(change_rows: list[ChangeRow]) -> set[str]:
+    """Keys that appear in row_add / row_delete / value_update (for sparse reviews)."""
+    keys: set[str] = set()
+    for row in change_rows:
+        if row.change_type in {"row_add", "row_delete", "value_update"} and row.key_tuple:
+            keys.add(row.key_tuple)
+    return keys
+
 
 _FILL_UPDATE = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
 _FILL_ADD = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
@@ -201,7 +211,7 @@ def _table_row_dict(table: ProphetTable) -> dict[str, dict[str, str]]:
     keyed = table.with_key_tuple()
     out: dict[str, dict[str, str]] = {}
     for row in keyed.iter_rows(named=True):
-        key_str = format_key_tuple(row["_key_tuple"])
+        key_str = row["_key_str"]
         values = {
             col: "" if row[col] is None else str(row[col]) for col in table.columns
         }
@@ -213,14 +223,24 @@ def _seed_rows(
     model: TableReviewModel,
     columns: list[str],
 ) -> dict[str, _ReviewRow]:
-    """Seed review rows from after snapshots, then fill gaps from before."""
-    row_map: dict[str, _ReviewRow] = {}
+    """
+    Seed review rows for changed keys only (sparse grid for large tables).
 
-    # Prefer after values (last contribution wins for unchanged display values)
+    Prefer after values; fill gaps from before. Keys are taken from change rows
+    (row_add / row_delete / value_update), not the full table.
+    """
+    row_map: dict[str, _ReviewRow] = {}
+    wanted: set[str] = set()
+    for contrib in model.contributions:
+        wanted |= _changed_keys_from_rows(contrib.change_rows)
+
+    # Prefer after values for wanted keys
     for contrib in model.contributions:
         if contrib.after is None:
             continue
         for key_str, values in _table_row_dict(contrib.after).items():
+            if key_str not in wanted:
+                continue
             if key_str not in row_map:
                 row_map[key_str] = _ReviewRow(
                     key_str=key_str,
@@ -232,11 +252,13 @@ def _seed_rows(
                     if c in values:
                         row_map[key_str].values[c] = values[c]
 
-    # Before-only keys (candidates for DELETE) — add if missing
+    # Before values for wanted keys still missing (or DELETE candidates)
     for contrib in model.contributions:
         if contrib.before is None:
             continue
         for key_str, values in _table_row_dict(contrib.before).items():
+            if key_str not in wanted:
+                continue
             if key_str not in row_map:
                 row_map[key_str] = _ReviewRow(
                     key_str=key_str,

@@ -37,7 +37,9 @@ Every table follows this exact structure:
 - Row 1, Columns 2 onwards: actual column headers.
 - Data rows: first cell is always `*`, followed by key values and data values.
 - Key columns = first `N` columns (the marker column + the next `N-1` columns).
-- All comparisons and matching use **exact string match** (no floating-point tolerance).
+- All comparisons and matching use **numeric-aware equality** for values that
+  parse as floats (e.g. `1.10` equals `1.1`); otherwise exact string match.
+  Keys are joined after the same numeric normalization.
 
 When writing output tables, the exact `!N` + `*` format must be preserved.
 
@@ -51,16 +53,18 @@ WorkingRoot/
 ├── ChangeRequests/
 │   ├── <change_request_id>/          ← folder name = change_request_id
 │   │   ├── before/
-│   │   │   └── *.csv
+│   │   │   ├── *.csv / *.FAC         ← also searched recursively in subfolders
+│   │   │   └── SubA/*.csv            ← identity = relative path (SubA/TABLE)
 │   │   └── after/
-│   │       └── *.csv
+│   │       └── ...
 │   └── ...
-├── Production_Tables/                ← current production snapshot
-│   └── *.csv
+├── Production_Tables/                ← current production snapshot (recursive)
+│   └── ...
 └── Output/
     ├── ChangeLog_YYYYMMDD_HHMM.xlsx
+    ├── ChangeLog_YYYYMMDD_HHMM_Detail.csv
     ├── IntegrationReport_YYYYMMDD_HHMM.xlsx
-    ├── New_Production_Tables/        ← final output tables (original filenames)
+    ├── New_Production_Tables/        ← final output tables (original relative paths)
     └── Audit/
         └── *.log
 ```
@@ -118,19 +122,20 @@ def generate_change_log(control_path: Path) -> Path:
 **Logic:**
 1. Read `Control.xlsx` → list of included change requests sorted by `order`.
 2. For each change request folder:
-   - Discover all CSV files in `before/` and `after/`.
-   - Tables present in both → compute detailed diff.
+   - Discover all CSV/FAC files in `before/` and `after/` **recursively**.
+     Table identity is the posix relative path without suffix (e.g. `SubA/MORT_TABLE`).
+   - Tables present in both → compute detailed diff (numeric-aware value compare).
    - Tables only in `after/` → record as full table add (`table_add`).
    - Tables only in `before/` → raise warning, record in Summary, **do not** generate any change rows for that table.
-3. Detect conflicts across change requests (same table + same key combination + same column, or structural collision).
-4. Write multi-sheet Change Log Excel.
+3. Detect conflicts across change requests (same table + same key combination + same column, structural collision, or missing row×column fill).
+4. Write Change Log Excel (Summary / Conflicts / review sheets) plus `ChangeLog_*_Detail.csv` sidecar.
 
-**Change Log Sheets:**
+**Change Log outputs:**
 
-**Summary**
+**Summary** (Excel)
 - change_request_id, description, tables_touched, n_value_changes, n_row_adds, n_row_deletes, n_column_changes, n_key_count_changes, has_conflict, status
 
-**ChangeLog_Detail**
+**ChangeLog_*_Detail.csv** (sidecar; used by Stage 2)
 | change_request_id | table_name | change_type | n_keys_before | n_keys_after | key_tuple | column_name | old_value | new_value | notes |
 
 **Supported `change_type` values:**
@@ -144,15 +149,18 @@ def generate_change_log(control_path: Path) -> Path:
 - `table_add` (table only exists in after)
 
 **Conflicts**
-- Populated only when overlaps are detected.
-- User must resolve conflicts (by editing ChangeLog_Detail or marking resolution) before Stage 2 can proceed in `apply` mode.
+- Populated when overlaps or gaps are detected:
+  - `cell_overlap` — same table + key + column touched by ≥2 CRs
+  - `structural_collision` — ≥2 CRs apply structural changes to the same table
+  - `missing_row_column_fill` — a `row_add` and a `column_add` leave their intersection cell with no Change Log value (Stage 2 would otherwise write blank). Supplement with a Detail `value_update` / `row_add` cell for that key+column, or set `resolved=Y` if blank is intentional.
+- User must resolve conflicts (by editing ChangeLog Detail / Control, or marking `resolved=Y`) before Stage 2 can proceed in `apply` mode.
 
 **Per-table review sheets** (one sheet per touched table name, e.g. `MORT_TABLE`)
 - Human review only — Stage 2 does **not** read these sheets.
 - Wide Prophet-style layout: `_change` column (`ADD` / `DELETE` / blank) plus table columns.
 - Value changes shown in-place as `old -> new` (with `[change_request_id]` when multiple CRs touch the same table).
 - Structural changes (`column_add`, `column_delete`, `column_rename`, `key_count_change`, `table_add`) listed as notes above the table header.
-- Unchanged rows included for context so the sheet still looks like the real table.
+- Only **changed** rows are included (sparse) so large tables stay practical in Excel.
 
 ---
 
@@ -175,7 +183,8 @@ def integrate_changes(
 2. Load Change Log and filter only `include=Y` + `approved=Y` change requests, sorted by `order`.
 3. Pre-validate:
    - All referenced tables exist in production (except pure `table_add`).
-   - For every `value_update` / `row_delete`: exact key + old_value must match current production.
+   - For every `value_update` / `row_delete`: the key must exist in current production.
+     Change Log `old_value` is informational and is **not** required to match production.
    - For `key_count_change`: only proceed if approved in Control.
    - For `column_rename`: only apply if declared in `ColumnRenames`.
    - No unresolved conflicts.
@@ -239,7 +248,7 @@ Every run writes a `.log` file containing:
   - Key-count changes
   - Tables only in `after` → `table_add`
   - Tables only in `before` → warning + skip (no changes generated)
-- [ ] Conflict detection works across multiple change requests (same table + same key + same column, or structural collisions).
+- [ ] Conflict detection works across multiple change requests (same table + same key + same column, structural collisions, or missing row×column fills).
 - [ ] Stage 2 respects `order` column and only processes `include = Y` + `approved = Y` rows.
 - [ ] `validate_only` mode never writes any output tables.
 - [ ] `apply` mode writes new CSVs with **original filenames** and preserves exact `!N` / `*` format.
@@ -262,7 +271,7 @@ Every run writes a `.log` file containing:
 | T07 | Key-count change (`!N` different) + approved = Y | Applied successfully |
 | T08 | Key-count change + approved = N               | Hard stop |
 | T09 | `validate_only` mode                          | Full validation report produced; **zero** files written to `New_Production_Tables/` |
-| T10 | Value in production does not match `old_value` in Change Log | Validation fails; clear message identifying the mismatched key |
+| T10 | Value in production does not match `old_value` in Change Log | Apply still succeeds; `new_value` overwrites production |
 | T11 | Run the same Change Log twice on identical production snapshot | Identical output tables (idempotent) |
 | T12 | Empty change request folder (no CSVs)         | Graceful handling; no crash; recorded in Summary |
 

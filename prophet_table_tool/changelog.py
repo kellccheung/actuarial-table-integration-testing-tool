@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 from collections import Counter
 from pathlib import Path
 
@@ -59,7 +60,7 @@ CONFLICT_HEADERS = [
 def generate_change_log(control_path: Path) -> Path:
     """
     Stage 1: Compare before/ vs after/ for each included change request
-    and write a structured ChangeLog_*.xlsx.
+    and write a ChangeLog_*.xlsx plus ChangeLog_*_Detail.csv sidecar.
 
     Returns the path to the generated Change Log workbook.
     """
@@ -95,8 +96,15 @@ def generate_change_log(control_path: Path) -> Path:
             before_dir = cr_dir / "before"
             after_dir = cr_dir / "after"
 
+            logger.info("[%s] discovering tables in before/ and after/", cr.change_request_id)
             before_tables = discover_csv_tables(before_dir)
             after_tables = discover_csv_tables(after_dir)
+            logger.info(
+                "[%s] found %d before table(s), %d after table(s)",
+                cr.change_request_id,
+                len(before_tables),
+                len(after_tables),
+            )
 
             if not before_tables and not after_tables:
                 msg = (
@@ -121,7 +129,6 @@ def generate_change_log(control_path: Path) -> Path:
                 )
                 continue
 
-            # Tables only in before → warning + skip
             only_before = set(before_tables) - set(after_tables)
             for table_name in sorted(only_before):
                 msg = (
@@ -134,7 +141,6 @@ def generate_change_log(control_path: Path) -> Path:
             cr_changes: list[ChangeRow] = []
             tables_touched: set[str] = set()
 
-            # Tables in both + tables only in after
             all_names = set(before_tables) | set(after_tables)
             for table_name in sorted(all_names):
                 if table_name in only_before:
@@ -151,6 +157,30 @@ def generate_change_log(control_path: Path) -> Path:
                     else None
                 )
 
+                n_before = 0 if before_tbl is None else before_tbl.data.height
+                n_after = 0 if after_tbl is None else after_tbl.data.height
+                if before_tbl is not None and before_tbl.source_encoding:
+                    logger.info(
+                        "[%s] read before %s encoding=%s",
+                        cr.change_request_id,
+                        table_name,
+                        before_tbl.source_encoding,
+                    )
+                if after_tbl is not None and after_tbl.source_encoding:
+                    logger.info(
+                        "[%s] read after %s encoding=%s",
+                        cr.change_request_id,
+                        table_name,
+                        after_tbl.source_encoding,
+                    )
+                logger.info(
+                    "[%s] comparing %s (%s→%s rows)...",
+                    cr.change_request_id,
+                    table_name,
+                    n_before,
+                    n_after,
+                )
+
                 diff = diff_table(
                     cr.change_request_id,
                     table_name,
@@ -160,6 +190,12 @@ def generate_change_log(control_path: Path) -> Path:
                 )
                 cr_changes.extend(diff.change_rows)
                 tables_touched |= diff.tables_touched
+                logger.info(
+                    "[%s] %s done, %d change row(s)",
+                    cr.change_request_id,
+                    table_name,
+                    len(diff.change_rows),
+                )
                 if diff.change_rows or table_name in diff.tables_touched:
                     add_contribution(
                         table_reviews,
@@ -190,7 +226,7 @@ def generate_change_log(control_path: Path) -> Path:
                     "n_row_deletes": counts.get("row_delete", 0),
                     "n_column_changes": n_col,
                     "n_key_count_changes": counts.get("key_count_change", 0),
-                    "has_conflict": "N",  # updated after conflict detection
+                    "has_conflict": "N",
                     "status": "OK" if cr_changes or tables_touched else "NO_CHANGES",
                 }
             )
@@ -207,8 +243,14 @@ def generate_change_log(control_path: Path) -> Path:
                     row["status"] = "CONFLICT"
 
         out_path = control.output_path / f"ChangeLog_{run_id}.xlsx"
+        detail_csv_path = control.output_path / f"ChangeLog_{run_id}_Detail.csv"
+
+        logger.info("writing detail CSV (%d rows): %s", len(all_changes), detail_csv_path)
+        _write_change_log_detail_csv(detail_csv_path, all_changes)
+
+        logger.info("writing Change Log workbook (Summary/Conflicts/reviews): %s", out_path)
         _write_change_log_excel(
-            out_path, summary_rows, all_changes, conflicts, table_reviews
+            out_path, summary_rows, conflicts, table_reviews
         )
 
         logger.info("tables_affected=%d", len({r.table_name for r in all_changes}))
@@ -218,6 +260,8 @@ def generate_change_log(control_path: Path) -> Path:
             logger.info("warning=%s", w)
         logger.info("change_log_path=%s", out_path)
         logger.info("change_log_hash=%s", file_hash(out_path))
+        logger.info("change_log_detail_path=%s", detail_csv_path)
+        logger.info("change_log_detail_hash=%s", file_hash(detail_csv_path))
 
         status = "SUCCESS"
         logger.info("final_status=%s", status)
@@ -231,16 +275,37 @@ def generate_change_log(control_path: Path) -> Path:
         close_audit_logger(logger)
 
 
+def _write_change_log_detail_csv(path: Path, change_rows: list[ChangeRow]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(DETAIL_HEADERS)
+        for row in change_rows:
+            writer.writerow(
+                [
+                    row.change_request_id,
+                    row.table_name,
+                    row.change_type,
+                    row.n_keys_before if row.n_keys_before is not None else "",
+                    row.n_keys_after if row.n_keys_after is not None else "",
+                    row.key_tuple,
+                    row.column_name,
+                    row.old_value,
+                    row.new_value,
+                    row.notes,
+                ]
+            )
+
+
 def _write_change_log_excel(
     path: Path,
     summary_rows: list[dict],
-    change_rows: list[ChangeRow],
     conflicts: list[dict],
     table_reviews: dict[str, TableReviewModel] | None = None,
 ) -> None:
+    """Write slim workbook: Summary + Conflicts + review sheets (no Detail tab)."""
     wb = Workbook()
 
-    # Summary
     ws = wb.active
     ws.title = "Summary"
     _write_header(ws, SUMMARY_HEADERS)
@@ -248,26 +313,6 @@ def _write_change_log_excel(
         for j, key in enumerate(SUMMARY_HEADERS, start=1):
             ws.cell(i, j, row.get(key, ""))
 
-    # ChangeLog_Detail
-    ws_detail = wb.create_sheet("ChangeLog_Detail")
-    _write_header(ws_detail, DETAIL_HEADERS)
-    for i, row in enumerate(change_rows, start=2):
-        values = [
-            row.change_request_id,
-            row.table_name,
-            row.change_type,
-            row.n_keys_before,
-            row.n_keys_after,
-            row.key_tuple,
-            row.column_name,
-            row.old_value,
-            row.new_value,
-            row.notes,
-        ]
-        for j, val in enumerate(values, start=1):
-            ws_detail.cell(i, j, val)
-
-    # Conflicts (only when overlaps detected — still create sheet for clarity)
     ws_conf = wb.create_sheet("Conflicts")
     _write_header(ws_conf, CONFLICT_HEADERS)
     for i, c in enumerate(conflicts, start=2):
@@ -286,7 +331,6 @@ def _write_change_log_excel(
         for j, val in enumerate(values, start=1):
             ws_conf.cell(i, j, val)
 
-    # Per-table human review sheets (ignored by Stage 2)
     if table_reviews:
         write_review_sheets(wb, table_reviews)
 

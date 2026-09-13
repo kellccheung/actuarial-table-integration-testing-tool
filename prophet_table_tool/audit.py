@@ -31,9 +31,9 @@ def setup_audit_logger(
     fh.setFormatter(logging.Formatter("%(message)s"))
     logger.addHandler(fh)
 
-    # Also echo warnings+ to stderr
+    # Also echo INFO+ to stderr so users see per-table progress
     sh = logging.StreamHandler()
-    sh.setLevel(logging.WARNING)
+    sh.setLevel(logging.INFO)
     sh.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
     logger.addHandler(sh)
 

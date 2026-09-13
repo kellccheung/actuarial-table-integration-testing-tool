@@ -153,31 +153,36 @@ If this sheet has no row for a table, the tool falls back to the CR-level `appro
 
 ### Stage 1 — Generate Change Log
 
-Compares `before/` vs `after/` for every included change request and writes:
+Compares `before/` vs `after/` for every included change request (including
+tables in **subfolders**; identity is the relative path, e.g. `SubA/MORT_TABLE`)
+and writes:
 
-`Output/ChangeLog_<run_id>.xlsx`
+- `Output/ChangeLog_<run_id>.xlsx` — Summary, Conflicts, and per-table review sheets
+- `Output/ChangeLog_<run_id>_Detail.csv` — machine-readable change rows used by Stage 2
 
-Sheets include:
+Workbook sheets:
 
 - **Summary** — per-CR counts and conflict flags
-- **ChangeLog_Detail** — row-level changes (`value_update`, `row_add`, `row_delete`, `column_add`, `column_delete`, `column_rename`, `key_count_change`, `table_add`); used by Stage 2
-- **Conflicts** — overlapping updates across CRs (same table + key + column, or structural collisions)
-- **One sheet per touched table** (e.g. `MORT_TABLE`) — human review only: Prophet-shaped wide layout with `_change` markers, `old -> new` in changed cells, and structural notes above the table. Stage 2 ignores these sheets.
+- **Conflicts** — one row per overlap or gap (see [Conflicts](#conflicts))
+- **One sheet per touched table** — human review only (changed rows); Stage 2 ignores these sheets. The `_change` column shows `[change_request_id]` for each changed row, with an `ADD` / `DELETE` prefix when the row was added or removed.
+
+Value comparison is **numeric-aware** (`1.10` equals `1.1`). CSV files are read
+with encoding fallback: utf-8-sig → utf-8 → cp1252 → latin-1.
 
 ```bash
 python -m prophet_table_tool WorkingRoot\Control.xlsx --mode generate_changelog
 ```
 
-**Review the Change Log before continuing.** Prefer the per-table review tabs for visual checks; use `ChangeLog_Detail` / `Conflicts` for the machine-readable record. If the Conflicts sheet has rows, resolve them (edit the detail / mark resolution as your process requires) before applying.
+**Review the Change Log before continuing.** Prefer the per-table review tabs for visual checks; use the Detail CSV / Conflicts for the machine-readable record. If the Conflicts sheet has rows, resolve them before applying (see [Conflicts](#conflicts)).
 
 ### Stage 2 — Validate only (dry run)
 
 Checks that the Change Log can be applied cleanly against current production:
 
 - Referenced tables exist (except pure `table_add`)
-- `value_update` / `row_delete` match current keys and `old_value`
+- `value_update` / `row_delete` keys exist in production (`old_value` is not required to match)
 - Column renames are declared; key-count changes are approved
-- No unresolved conflicts
+- Unresolved conflicts are listed as FAIL rows (see [Conflicts](#conflicts))
 
 Writes `Output/IntegrationReport_<run_id>.xlsx` and an audit log. **Does not write** any files under `New_Production_Tables/`.
 
@@ -201,6 +206,56 @@ Stage 2 only processes change requests with **`include = Y` and `approved = Y`**
 
 ---
 
+## Conflicts
+
+Conflicts are detected in **Stage 1** after every included change request has been compared (`before/` vs `after/`). They are written to the Change Log **Conflicts** sheet (`resolved` starts as `N`). The Summary sheet sets `has_conflict = Y` and `status = CONFLICT` for each CR involved.
+
+Stage 2 does **not** re-detect conflicts from the Detail CSV. It reads the Conflicts sheet as stored in the Change Log workbook. `apply` **hard-stops** (writes no files under `New_Production_Tables/`) while any conflict that still involves an `include=Y` + `approved=Y` CR has `resolved` other than `Y`. `validate_only` records the same rows as FAIL in the Integration Report so you can see them before applying.
+
+A conflict is ignored in Stage 2 only if you mark `resolved=Y`, delete that Conflicts row, or exclude **every** CR listed on that row (`include=N` or `approved=N`). Excluding just one of the listed CRs is not enough unless you also mark the row resolved.
+
+### When each type is raised
+
+| Type | Raised when | Typical example |
+|------|-------------|-----------------|
+| `cell_overlap` | Two or more CRs touch the **same cell** (same table + same key combination + same column) with `value_update`, `row_add`, or `row_delete`. Flagged even when both CRs write the same `new_value`. | CR_A and CR_B both change `Rate` for `Age=20, Duration=1, Product=PROD_A`. |
+| `structural_collision` | Two or more CRs apply **structural** changes to the **same table**. Structural types: `column_add`, `column_delete`, `column_rename`, `key_count_change`, `table_add`. Different columns still collide if they are on the same table. | CR_A adds a column and CR_B renames another column on `MORT_TABLE`. |
+| `missing_row_column_fill` | A `row_add` and a `column_add` on the same table leave their **intersection cell** with no covering `row_add` / `value_update` in the Detail CSV. Can be one CR or several. | CR_A adds a new age row; CR_B adds `NewCol`; neither supplies a value for that new row × `NewCol`. |
+
+Not a conflict (handled elsewhere): a table only in `before/` (warning + skip), an undeclared column rename, or an unapproved key-count change. Those are separate hard-stops — see [Safety rules](#safety-rules-what-will-block-you).
+
+### How to find them
+
+1. Open `Output/ChangeLog_*.xlsx`.
+2. **Summary** — any CR with `has_conflict = Y`.
+3. **Conflicts** — one row per issue: type, table, key, column, CR ids, old/new values, notes, `resolved`.
+4. **Per-table review tabs** — useful for `cell_overlap`: `_change` names the related CR(s); changed cells show `old -> new` and `[change_request_id]` when more than one CR touches the table. These tabs are human review only; Stage 2 does not read them.
+
+### How to resolve them
+
+Prefer fixing the **source** (Control and/or `before/` / `after/`) and **re-running Stage 1**. Regenerating the Change Log rebuilds Conflicts from scratch (`resolved` resets to `N` if the overlap is still present).
+
+**`cell_overlap`** — decide which CR should win, then do one of:
+
+- Set `include = N` on the losing CR in Control and re-run Stage 1 (cleanest).
+- Edit that CR’s `before/` / `after/` so it no longer changes the cell, then re-run Stage 1.
+- Edit `ChangeLog_*_Detail.csv`: delete or change the losing CR’s rows for that table + key + column, **and** set `resolved = Y` on the Conflicts row. Editing Detail alone does not clear the Conflicts sheet.
+
+**`structural_collision`** — do not leave two structural CRs on the same table in one run. Merge the structural work into a **single** CR folder (one `before/` / `after/` pair), or exclude one CR, then re-run Stage 1. Mark `resolved = Y` only if you have already merged or sequenced the work by hand and accept applying the remaining Detail rows as-is.
+
+**`missing_row_column_fill`** — supply the missing cell:
+
+- Put the intended value in `after/` (so the covering `row_add` / `value_update` is generated) and re-run Stage 1, **or** add that cell as a row in `ChangeLog_*_Detail.csv` and set `resolved = Y` on the Conflicts row.
+- If a **blank** cell is intentional, set `resolved = Y` on that Conflicts row without adding a value. Stage 2 will then write a blank at that intersection.
+
+### Marking `resolved = Y`
+
+On the Conflicts sheet, change `resolved` from `N` to `Y` (also accepted: `YES`, `TRUE`, `1`). Use this only after you have decided the outcome — edited Detail, excluded CRs, merged folders, or confirmed a blank fill.
+
+Then run `validate_only`, and only then `apply`.
+
+---
+
 ## Outputs & audit
 
 | Output | When |
@@ -218,10 +273,10 @@ Each audit log records timestamp, mode, Control/Change Log hashes, CRs processed
 
 | Situation | Behaviour |
 |-----------|-----------|
-| Unresolved conflicts in Change Log | Hard stop in `apply` |
+| Unresolved conflicts in Change Log | Hard stop in `apply` (see [Conflicts](#conflicts)) |
 | Key-count change without approval | Hard stop |
 | Column rename not listed in `ColumnRenames` | Hard stop |
-| Production value ≠ Change Log `old_value` | Validation fails |
+| Production value ≠ Change Log `old_value` | Allowed — `new_value` is still applied |
 | Table only in `before/` | Warning + skip (no auto-delete) |
 | `validate_only` | Never writes new production tables |
 
@@ -235,7 +290,7 @@ Matching is **exact string** only. Re-running the same Change Log on the same pr
 2. For each change request, drop baseline tables in `before/` and revised tables in `after/`.
 3. Register each CR in Control (`include` / `approved` / `order`).
 4. Declare any column renames; approve any key-count changes.
-5. Run Stage 1 → review Summary, per-table tabs, Detail, and Conflicts.
+5. Run Stage 1 → review Summary, per-table tabs, Detail, and Conflicts. Resolve any Conflicts rows before Stage 2 (see [Conflicts](#conflicts)).
 6. Run `validate_only` → fix any validation failures.
 7. Run `apply` → take `New_Production_Tables/` as the candidate production set.
 8. Keep the Change Log, Integration Report, and Audit logs with the quarter’s records.
@@ -266,7 +321,7 @@ Detailed behaviour and acceptance cases (T01–T12) are documented in [`Prophet_
 | `--change-log is required` / no Change Log found | Stage 2 needs a `ChangeLog_*.xlsx` in `Output\` (run Stage 1 first); CLI needs `--change-log` |
 | Change request not processed | Folder name = `change_request_id`; Stage 2 needs `include=Y` **and** `approved=Y` |
 | Empty Change Log for a table | Confirm CSVs are under `before/` and `after/` with matching names |
-| Apply refused after conflict | Open Change Log **Conflicts** sheet and resolve overlapping CRs |
+| Apply refused after conflict | Open the Change Log **Conflicts** sheet and follow [Conflicts](#conflicts). `apply` stops until every remaining row is `resolved=Y` or no longer involves an included+approved CR |
 | Rename / key-count hard stop | Fill `ColumnRenames` or `KeyCountApprovals` (or CR `approved`) |
 
 For design-level detail (change types, conflict rules, developer checklist), see the function documentation linked above.

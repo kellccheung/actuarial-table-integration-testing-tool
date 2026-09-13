@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 from collections import defaultdict
 from pathlib import Path
 from typing import Literal
@@ -12,7 +13,13 @@ from openpyxl.styles import Font
 
 from .audit import close_audit_logger, setup_audit_logger
 from .control import ControlConfig, read_control
-from .prophet_csv import ProphetTable, discover_csv_tables, read_prophet_csv, write_prophet_csv
+from .prophet_csv import (
+    ProphetTable,
+    discover_csv_tables,
+    normalized_key_expr,
+    read_prophet_csv,
+    write_prophet_csv,
+)
 from .utils import file_hash, generate_run_id, yn_to_bool
 
 
@@ -59,7 +66,6 @@ def integrate_changes(
         logger.info("change_log_hash=%s", file_hash(change_log_path))
         logger.info("production_tables_path=%s", control.production_tables_path)
 
-        # Only include=Y + approved=Y, sorted by order
         approved_crs = control.included_requests(require_approved=True)
         cr_order = {r.change_request_id: r.order for r in approved_crs}
         cr_ids = {r.change_request_id for r in approved_crs}
@@ -76,8 +82,8 @@ def integrate_changes(
                 r["column_name"],
             )
         )
+        logger.info("loaded %d detail change row(s)", len(detail_rows))
 
-        # --- Pre-validate: unresolved conflicts ---
         unresolved = [
             c
             for c in conflicts
@@ -101,48 +107,74 @@ def integrate_changes(
                 logger.info("final_status=%s", status)
                 return report_path
 
-        # Load production tables into memory
+        logger.info("loading production tables from %s", control.production_tables_path)
         prod_paths = discover_csv_tables(control.production_tables_path)
-        tables: dict[str, ProphetTable] = {
-            name: read_prophet_csv(path) for name, path in prod_paths.items()
-        }
+        logger.info("discovered %d production table(s)", len(prod_paths))
+        tables: dict[str, ProphetTable] = {}
+        for name, path in prod_paths.items():
+            logger.info("reading production table %s", name)
+            tables[name] = read_prophet_csv(path)
 
-        # Group detail by CR then table for ordered application
         by_cr_table: dict[str, dict[str, list[dict]]] = defaultdict(lambda: defaultdict(list))
         for row in detail_rows:
             by_cr_table[row["change_request_id"]][row["table_name"]].append(row)
 
-        # --- Validation pass ---
         ok = True
         for cr in approved_crs:
             for table_name, rows in by_cr_table.get(cr.change_request_id, {}).items():
+                logger.info(
+                    "[%s] validating %s (%d change row(s))...",
+                    cr.change_request_id,
+                    table_name,
+                    len(rows),
+                )
                 table_ok, msgs = _validate_table_changes(
                     control, cr.change_request_id, table_name, rows, tables
                 )
                 validation_messages.extend(msgs)
                 if not table_ok:
                     ok = False
+                    logger.warning("[%s] validation FAILED for %s", cr.change_request_id, table_name)
+                else:
+                    logger.info("[%s] validation OK for %s", cr.change_request_id, table_name)
 
         if not ok:
             status = "FAILED"
             _write_integration_report(report_path, validation_messages, status, mode)
-            logger.info("n_validation_failures=%d", sum(1 for m in validation_messages if m["severity"] == "FAIL"))
+            logger.info(
+                "n_validation_failures=%d",
+                sum(1 for m in validation_messages if m["severity"] == "FAIL"),
+            )
             logger.info("final_status=%s", status)
             return report_path
 
         if mode == "validate_only":
             status = "DRY_RUN_SUCCESS"
             validation_messages.append(
-                _vmsg("summary", "", "", "", "", "", "Validation passed (dry-run); no tables written.", "INFO")
+                _vmsg(
+                    "summary",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "Validation passed (dry-run); no tables written.",
+                    "INFO",
+                )
             )
             _write_integration_report(report_path, validation_messages, status, mode)
             logger.info("tables_affected=%d", len({r["table_name"] for r in detail_rows}))
             logger.info("final_status=%s", status)
             return report_path
 
-        # --- Apply ---
         for cr in approved_crs:
             for table_name, rows in by_cr_table.get(cr.change_request_id, {}).items():
+                logger.info(
+                    "[%s] applying %s (%d change row(s))...",
+                    cr.change_request_id,
+                    table_name,
+                    len(rows),
+                )
                 tables[table_name] = _apply_table_changes(
                     control, cr.change_request_id, table_name, rows, tables
                 )
@@ -158,15 +190,16 @@ def integrate_changes(
                         "INFO",
                     )
                 )
+                logger.info("[%s] applied %s", cr.change_request_id, table_name)
 
         out_dir = control.output_path / "New_Production_Tables"
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        # Write all production tables (updated + untouched) with original filenames
-        # and extensions (.csv / .FAC). Dummy lines from production are preserved.
         written = 0
         for name, table in tables.items():
-            write_prophet_csv(table, out_dir / f"{name}{table.source_suffix}")
+            out_path = out_dir / Path(name).with_suffix(table.source_suffix)
+            logger.info("writing %s -> %s", name, out_path)
+            write_prophet_csv(table, out_path)
             written += 1
 
         validation_messages.append(
@@ -216,10 +249,74 @@ def _vmsg(
     }
 
 
-def _load_change_log(path: Path) -> tuple[list[dict], list[dict]]:
-    wb = load_workbook(path, data_only=True, read_only=True)
+def _detail_csv_path_for(change_log_path: Path) -> Path:
+    """Sidecar path: ChangeLog_{run_id}.xlsx → ChangeLog_{run_id}_Detail.csv."""
+    return change_log_path.with_name(f"{change_log_path.stem}_Detail.csv")
 
+
+def _load_change_log(path: Path) -> tuple[list[dict], list[dict]]:
+    detail_csv = _detail_csv_path_for(path)
+    if detail_csv.is_file():
+        detail = _load_detail_csv(detail_csv)
+    else:
+        detail = _load_detail_from_excel(path)
+
+    conflicts: list[dict] = []
+    wb = load_workbook(path, data_only=True, read_only=True)
+    if "Conflicts" in wb.sheetnames:
+        ws = wb["Conflicts"]
+        rows = ws.iter_rows(values_only=True)
+        header = next(rows, None)
+        if header:
+            keys = [str(h).strip() if h else f"col{i}" for i, h in enumerate(header)]
+            for row in rows:
+                if not row or all(c is None for c in row):
+                    continue
+                d = {keys[i]: (row[i] if i < len(row) else None) for i in range(len(keys))}
+                cr_raw = str(d.get("change_request_ids") or "")
+                conflicts.append(
+                    {
+                        "conflict_type": str(d.get("conflict_type") or ""),
+                        "table_name": str(d.get("table_name") or ""),
+                        "key_tuple": str(d.get("key_tuple") or ""),
+                        "column_name": str(d.get("column_name") or ""),
+                        "change_request_ids": [x.strip() for x in cr_raw.split(",") if x.strip()],
+                        "resolved": d.get("resolved", "N"),
+                        "notes": str(d.get("notes") or ""),
+                    }
+                )
+    wb.close()
+    return detail, conflicts
+
+
+def _load_detail_csv(path: Path) -> list[dict]:
     detail: list[dict] = []
+    with path.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        for d in reader:
+            if not d or not (d.get("change_request_id") or "").strip():
+                continue
+            detail.append(
+                {
+                    "change_request_id": str(d.get("change_request_id") or "").strip(),
+                    "table_name": str(d.get("table_name") or "").strip(),
+                    "change_type": str(d.get("change_type") or "").strip(),
+                    "n_keys_before": d.get("n_keys_before") or None,
+                    "n_keys_after": d.get("n_keys_after") or None,
+                    "key_tuple": str(d.get("key_tuple") or ""),
+                    "column_name": str(d.get("column_name") or ""),
+                    "old_value": "" if d.get("old_value") is None else str(d.get("old_value")),
+                    "new_value": "" if d.get("new_value") is None else str(d.get("new_value")),
+                    "notes": str(d.get("notes") or ""),
+                }
+            )
+    return detail
+
+
+def _load_detail_from_excel(path: Path) -> list[dict]:
+    """Fallback for older Change Logs that still embed ChangeLog_Detail."""
+    detail: list[dict] = []
+    wb = load_workbook(path, data_only=True, read_only=True)
     if "ChangeLog_Detail" in wb.sheetnames:
         ws = wb["ChangeLog_Detail"]
         rows = ws.iter_rows(values_only=True)
@@ -244,33 +341,8 @@ def _load_change_log(path: Path) -> tuple[list[dict], list[dict]]:
                         "notes": str(d.get("notes") or ""),
                     }
                 )
-
-    conflicts: list[dict] = []
-    if "Conflicts" in wb.sheetnames:
-        ws = wb["Conflicts"]
-        rows = ws.iter_rows(values_only=True)
-        header = next(rows, None)
-        if header:
-            keys = [str(h).strip() if h else f"col{i}" for i, h in enumerate(header)]
-            for row in rows:
-                if not row or all(c is None for c in row):
-                    continue
-                d = {keys[i]: (row[i] if i < len(row) else None) for i in range(len(keys))}
-                cr_raw = str(d.get("change_request_ids") or "")
-                conflicts.append(
-                    {
-                        "conflict_type": str(d.get("conflict_type") or ""),
-                        "table_name": str(d.get("table_name") or ""),
-                        "key_tuple": str(d.get("key_tuple") or ""),
-                        "column_name": str(d.get("column_name") or ""),
-                        "change_request_ids": [x.strip() for x in cr_raw.split(",") if x.strip()],
-                        "resolved": d.get("resolved", "N"),
-                        "notes": str(d.get("notes") or ""),
-                    }
-                )
-
     wb.close()
-    return detail, conflicts
+    return detail
 
 
 def _validate_table_changes(
@@ -301,7 +373,6 @@ def _validate_table_changes(
         )
         return ok, msgs
 
-    # Key-count change approval
     for r in rows:
         if r["change_type"] == "key_count_change":
             if not control.is_key_count_approved(cr_id, table_name):
@@ -319,7 +390,6 @@ def _validate_table_changes(
                     )
                 )
 
-    # Column rename must be declared
     for r in rows:
         if r["change_type"] == "column_rename":
             declared = control.renames_for(cr_id, table_name)
@@ -348,10 +418,9 @@ def _validate_table_changes(
     table = tables[table_name]
     keyed = table.with_key_tuple()
 
-    # Build lookup: key_str -> row dict
     lookup: dict[str, dict] = {}
     for row in keyed.iter_rows(named=True):
-        key_str = "|".join("" if v is None else str(v) for v in row["_key_tuple"])
+        key_str = row["_key_str"]
         lookup[key_str] = row
 
     for r in rows:
@@ -375,42 +444,8 @@ def _validate_table_changes(
                 )
             )
             continue
-        if ct == "value_update" and col:
-            prod_val = lookup[key_str].get(col)
-            prod_s = "" if prod_val is None else str(prod_val)
-            if prod_s != r["old_value"]:
-                ok = False
-                msgs.append(
-                    _vmsg(
-                        "validation",
-                        cr_id,
-                        table_name,
-                        ct,
-                        key_str,
-                        col,
-                        f"old_value mismatch: change log has {r['old_value']!r}, "
-                        f"production has {prod_s!r}.",
-                        "FAIL",
-                    )
-                )
-        if ct == "row_delete" and col and col in lookup[key_str]:
-            prod_val = lookup[key_str].get(col)
-            prod_s = "" if prod_val is None else str(prod_val)
-            if r["old_value"] and prod_s != r["old_value"]:
-                ok = False
-                msgs.append(
-                    _vmsg(
-                        "validation",
-                        cr_id,
-                        table_name,
-                        ct,
-                        key_str,
-                        col,
-                        f"row_delete old_value mismatch for column {col}: "
-                        f"expected {r['old_value']!r}, production has {prod_s!r}.",
-                        "FAIL",
-                    )
-                )
+        # old_value in the Change Log is informational only — it is not required
+        # to match the current production cell.
 
     if ok:
         msgs.append(
@@ -438,17 +473,15 @@ def _apply_table_changes(
     """Apply all change rows for one CR+table; return the updated ProphetTable."""
     types = {r["change_type"] for r in rows}
 
-    # --- table_add: build from row_add entries ---
     if "table_add" in types:
         n_keys = None
         for r in rows:
-            if r["n_keys_after"] is not None:
+            if r["n_keys_after"] is not None and str(r["n_keys_after"]).strip() != "":
                 n_keys = int(r["n_keys_after"])
                 break
         if n_keys is None:
             n_keys = 1
 
-        # Collect columns and values from row_add
         add_rows = [r for r in rows if r["change_type"] == "row_add"]
         col_order: list[str] = []
         by_key: dict[str, dict[str, str]] = {}
@@ -458,7 +491,6 @@ def _apply_table_changes(
                 col_order.append(col)
             by_key.setdefault(r["key_tuple"], {})[col] = r["new_value"]
 
-        # Deterministic row order by key_tuple
         records = []
         for key in sorted(by_key.keys()):
             vals = by_key[key]
@@ -480,12 +512,11 @@ def _apply_table_changes(
     trailing_dummy_lines = list(table.trailing_dummy_lines)
     source_path = table.source_path
 
-    # key_count_change
     for r in rows:
         if r["change_type"] == "key_count_change" and r["n_keys_after"] is not None:
-            n_keys = int(r["n_keys_after"])
+            if str(r["n_keys_after"]).strip() != "":
+                n_keys = int(r["n_keys_after"])
 
-    # column_rename
     for r in rows:
         if r["change_type"] == "column_rename":
             old_c, new_c = r["old_value"], r["new_value"]
@@ -493,13 +524,11 @@ def _apply_table_changes(
                 columns = [new_c if c == old_c else c for c in columns]
                 data = data.rename({old_c: new_c})
 
-    # column_add — insert into key zone when key-count expanded
     for r in rows:
         if r["change_type"] == "column_add":
             col = r["column_name"]
             if col and col not in columns:
                 if n_keys > original_n_keys:
-                    # New key column sits after the previous key columns
                     insert_at = max(original_n_keys - 1, 0)
                     insert_at = min(insert_at, len(columns))
                     columns.insert(insert_at, col)
@@ -508,7 +537,6 @@ def _apply_table_changes(
                 data = data.with_columns(pl.lit("").cast(pl.Utf8).alias(col))
                 data = data.select(columns)
 
-    # column_delete
     for r in rows:
         if r["change_type"] == "column_delete":
             col = r["column_name"]
@@ -516,26 +544,23 @@ def _apply_table_changes(
                 columns = [c for c in columns if c != col]
                 data = data.drop(col)
 
-    # Match change-log key_tuples using the pre-expansion key columns.
-    # (Stage 1 emits overlapping/old keys when n_keys differs.)
     match_key_cols = columns[: max(original_n_keys - 1, 0)]
     final_key_cols = columns[: max(n_keys - 1, 0)]
 
     def key_str_expr(key_cols: list[str]):
         if not key_cols:
             return pl.lit("")
-        return pl.concat_str([pl.col(c).cast(pl.Utf8) for c in key_cols], separator="|")
+        return pl.concat_str(
+            [normalized_key_expr(c) for c in key_cols],
+            separator="|",
+        )
 
     data = data.with_columns(key_str_expr(match_key_cols).alias("_key_str"))
 
-    # row_delete
-    delete_keys = {
-        r["key_tuple"] for r in rows if r["change_type"] == "row_delete"
-    }
+    delete_keys = {r["key_tuple"] for r in rows if r["change_type"] == "row_delete"}
     if delete_keys:
         data = data.filter(~pl.col("_key_str").is_in(list(delete_keys)))
 
-    # value_update
     updates = [r for r in rows if r["change_type"] == "value_update"]
     if updates:
         by_key: dict[str, dict[str, str]] = defaultdict(dict)
@@ -557,7 +582,6 @@ def _apply_table_changes(
                     .alias(col)
                 )
 
-    # row_add
     add_rows = [r for r in rows if r["change_type"] == "row_add"]
     if add_rows:
         by_key = defaultdict(dict)
@@ -568,7 +592,6 @@ def _apply_table_changes(
         for key_str, col_vals in sorted(by_key.items()):
             key_parts = key_str.split("|") if key_str else []
             record = {c: col_vals.get(c, "") for c in columns}
-            # Prefer final key columns when key_tuple arity matches; else match keys
             apply_keys = (
                 final_key_cols
                 if len(key_parts) == len(final_key_cols)
@@ -630,7 +653,6 @@ def _write_integration_report(
         ws.cell(i, len(REPORT_HEADERS) + 1, status)
         ws.cell(i, len(REPORT_HEADERS) + 2, mode)
 
-    # Summary sheet
     ws2 = wb.create_sheet("Summary")
     ws2["A1"] = "status"
     ws2["B1"] = status

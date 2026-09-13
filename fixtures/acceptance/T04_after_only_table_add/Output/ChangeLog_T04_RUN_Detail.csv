@@ -1,0 +1,8 @@
+change_request_id,table_name,change_type,n_keys_before,n_keys_after,key_tuple,column_name,old_value,new_value,notes
+CR_T04_TableAdd,NEW_LOADING_TABLE,table_add,,2,,,,,Table only present in after/
+CR_T04_TableAdd,NEW_LOADING_TABLE,row_add,,2,LOW,Band,,LOW,Part of table_add
+CR_T04_TableAdd,NEW_LOADING_TABLE,row_add,,2,LOW,Factor,,0.90,Part of table_add
+CR_T04_TableAdd,NEW_LOADING_TABLE,row_add,,2,MID,Band,,MID,Part of table_add
+CR_T04_TableAdd,NEW_LOADING_TABLE,row_add,,2,MID,Factor,,1.00,Part of table_add
+CR_T04_TableAdd,NEW_LOADING_TABLE,row_add,,2,HIGH,Band,,HIGH,Part of table_add
+CR_T04_TableAdd,NEW_LOADING_TABLE,row_add,,2,HIGH,Factor,,1.10,Part of table_add

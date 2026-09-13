@@ -1,0 +1,2 @@
+change_request_id,table_name,change_type,n_keys_before,n_keys_after,key_tuple,column_name,old_value,new_value,notes
+CR_T11_Idempotent,MORT_TABLE,value_update,4,4,20|1|PROD_A,Rate,0.0012,0.0013,

@@ -1,0 +1,4 @@
+change_request_id,table_name,change_type,n_keys_before,n_keys_after,key_tuple,column_name,old_value,new_value,notes
+CR_T08_KeyCount,MORT_TABLE,key_count_change,4,5,,,4,5,Structural key-count change
+CR_T08_KeyCount,MORT_TABLE,column_add,4,5,,Sex,,,
+CR_T08_KeyCount,MORT_TABLE,value_update,4,5,20|1|PROD_A,Sex,,M,Value on newly added column

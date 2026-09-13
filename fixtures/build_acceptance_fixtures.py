@@ -482,14 +482,14 @@ def build_t09() -> Path:
 
 
 # ---------------------------------------------------------------------------
-# T10 – Production old_value mismatch
+# T10 – Production old_value mismatch (still applies new_value)
 # ---------------------------------------------------------------------------
 
 def build_t10() -> Path:
     d = _reset_case("T10_old_value_mismatch")
     b1, a1 = _cr_dirs(d, "CR_T10_Mismatch")
 
-    # before/after assume old Rate=0.0012
+    # before/after assume old Rate=0.0012 → 0.0013
     mort_after = [
         ["20", "1", "PROD_A", "0.0013", "1.05"],
         ["25", "1", "PROD_A", "0.0015", "1.05"],
@@ -505,6 +505,8 @@ def build_t10() -> Path:
         ["30", "1", "PROD_B", "0.0020", "1.10"],
     ]
     _write_csv(d / "Production_Tables" / "MORT_TABLE.csv", MORT_N, MORT_COLS, prod_mismatch)
+    # After apply, new_value overwrites the mismatched production cell
+    _write_csv(d / "expected" / "MORT_TABLE.csv", MORT_N, MORT_COLS, mort_after)
 
     _write_control(
         d / "Control.xlsx",

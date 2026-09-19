@@ -1,7 +1,7 @@
 # Prophet Table Change Consolidation & Integration Tool
 **Function Documentation v1.0**  
 **Target Language:** Python 3.11+  
-**Key Libraries:** `polars`, `openpyxl` / `xlsxwriter`, `pathlib`, `logging`, `hashlib`, `datetime`
+**Key Libraries:** `polars==1.44.2`, `openpyxl` / `xlsxwriter`, `pathlib`, `logging`, `hashlib`, `datetime`
 
 ---
 
@@ -63,6 +63,10 @@ WorkingRoot/
 └── Output/
     ├── ChangeLog_YYYYMMDD_HHMM.xlsx
     ├── ChangeLog_YYYYMMDD_HHMM_Detail.csv
+    ├── ChangeLog_YYYYMMDD_HHMM_reviews/  ← human review, one workbook per first-level folder
+    │   ├── root.xlsx
+    │   ├── BE.xlsx
+    │   └── IFRS.xlsx
     ├── IntegrationReport_YYYYMMDD_HHMM.xlsx
     ├── New_Production_Tables/        ← final output tables (original relative paths)
     └── Audit/
@@ -128,7 +132,7 @@ def generate_change_log(control_path: Path) -> Path:
    - Tables only in `after/` → record as full table add (`table_add`).
    - Tables only in `before/` → raise warning, record in Summary, **do not** generate any change rows for that table.
 3. Detect conflicts across change requests (same table + same key combination + same column, structural collision, or missing row×column fill).
-4. Write Change Log Excel (Summary / Conflicts / review sheets) plus `ChangeLog_*_Detail.csv` sidecar.
+4. Write Change Log Excel (Summary / Conflicts / ReviewFiles index) plus `ChangeLog_*_Detail.csv` sidecar and per-folder review workbooks under `ChangeLog_*_reviews/`.
 
 **Change Log outputs:**
 
@@ -150,13 +154,19 @@ def generate_change_log(control_path: Path) -> Path:
 
 **Conflicts**
 - Populated when overlaps or gaps are detected:
-  - `cell_overlap` — same table + key + column touched by ≥2 CRs
+  - `cell_overlap` — same table + key + column touched by ≥2 CRs, including when they write the same `new_value` (numeric-aware). Conflicts `notes` distinguish same-value overlaps, sequenced `row_add`/`column_add` + `value_update`, and differing independent updates. Set `resolved=Y` to apply both remaining Detail rows in Control `order` (later CR wins). A second `row_add` of the same key is still rejected in Stage 2 (`key already exists`).
   - `structural_collision` — ≥2 CRs apply structural changes to the same table
   - `missing_row_column_fill` — a `row_add` and a `column_add` leave their intersection cell with no Change Log value (Stage 2 would otherwise write blank). Supplement with a Detail `value_update` / `row_add` cell for that key+column, or set `resolved=Y` if blank is intentional.
 - User must resolve conflicts (by editing ChangeLog Detail / Control, or marking `resolved=Y`) before Stage 2 can proceed in `apply` mode.
 
-**Per-table review sheets** (one sheet per touched table name, e.g. `MORT_TABLE`)
-- Human review only — Stage 2 does **not** read these sheets.
+**ReviewFiles** (canonical Change Log)
+- Index of human-review workbooks: `table_name`, `group` (first path segment, or `root`), `review_file`.
+- Stage 2 does **not** read this sheet.
+
+**Per-folder review workbooks** (`ChangeLog_*_reviews/<group>.xlsx`)
+- One workbook per first-level production-table folder (`MORT_TABLE` → `root.xlsx`; `BE/MORT_TABLE` → `BE.xlsx`; `IFRS/FOO` → `IFRS.xlsx`). Deeper paths stay in the first-level file (`BE/sub/X` → `BE.xlsx`).
+- Each file has a Conflicts sheet filtered to that folder’s tables, plus one review sheet per touched table.
+- Human review only — Stage 2 does **not** read these files.
 - Wide Prophet-style layout: `_change` column plus table columns. `_change` names the originating change request (`[change_request_id]`) and prefixes `ADD` / `DELETE` for row adds/deletes.
 - Value changes shown in-place as `old -> new` (with `[change_request_id]` when multiple CRs touch the same table).
 - Structural changes (`column_add`, `column_delete`, `column_rename`, `key_count_change`, `table_add`) listed as notes above the table header.
@@ -182,16 +192,18 @@ def integrate_changes(
 1. Load production tables.
 2. Load Change Log and filter only `include=Y` + `approved=Y` change requests, sorted by `order`.
 3. Pre-validate:
-   - All referenced tables exist in production (except pure `table_add`).
-   - For every `value_update` / `row_delete`: the key must exist in current production.
-     Change Log `old_value` is informational and is **not** required to match production.
-   - For `key_count_change`: only proceed if approved in Control.
-   - For `column_rename`: only apply if declared in `ColumnRenames`.
-   - No unresolved conflicts.
+   - No unresolved conflicts (`apply` hard-stops; `validate_only` records FAIL rows and continues).
+   - Then, **per CR in Control `order`**, validate against the **current in-memory tables** (after earlier CRs have been applied in memory):
+     - All referenced tables exist (except pure `table_add`).
+     - For every `value_update` / `row_delete`: the key must exist in the current table.
+       Change Log `old_value` is informational and is **not** required to match.
+     - For every `row_add`: the key must **not** already exist in the current table.
+     - For `key_count_change`: only proceed if approved in Control.
+     - For `column_rename`: only apply if declared in `ColumnRenames`.
+   - If a CR validates, apply it in memory so the next CR sees its rows/columns. `validate_only` uses the same sequence and still writes no CSVs.
 4. If any validation fails → stop and write detailed Validation_Report (never write tables in `validate_only` or on failure).
 5. If `mode == "apply"` and validation passes:
-   - Apply changes sequentially in the order defined in Control.
-   - Write new CSV files to `Output/New_Production_Tables/` using **original filenames**.
+   - Write the in-memory tables to `Output/New_Production_Tables/` using **original filenames**.
    - Preserve exact `!N` + `*` format.
 6. Always produce Integration Report + timestamped audit log.
 
@@ -216,6 +228,8 @@ Every run writes a `.log` file containing:
 - Exact string match only (no tolerance).
 - Tables only in `before` → warning + skip (never delete automatically).
 - Unresolved conflicts → hard stop in `apply` mode.
+- `row_add` when the key already exists in the current (sequential) table → hard stop.
+- `value_update` / `row_delete` when the key is not in the current table → hard stop.
 - Key count change without approval → hard stop.
 - Column rename without explicit declaration → hard stop.
 - Always support pure dry-run (`validate_only`).
@@ -229,7 +243,7 @@ Every run writes a `.log` file containing:
 - Parse the special first row carefully; never treat the `!N` or `*` rows as normal data.
 - Represent keys as a tuple (or struct) of the first `N` columns for reliable matching.
 - Keep all intermediate results as Polars DataFrames until final Excel writing.
-- Use `openpyxl` for reading Control and writing formatted Change Log / Reports.
+- Use `openpyxl` for reading Control / writing the slim Change Log index and Integration Report; use `xlsxwriter` for per-folder review workbooks.
 - Generate `run_id` as `YYYYMMDD_HHMMSS`.
 
 ---
@@ -250,6 +264,7 @@ Every run writes a `.log` file containing:
   - Tables only in `before` → warning + skip (no changes generated)
 - [ ] Conflict detection works across multiple change requests (same table + same key + same column, structural collisions, or missing row×column fills).
 - [ ] Stage 2 respects `order` column and only processes `include = Y` + `approved = Y` rows.
+- [ ] Stage 2 validates each CR against the in-memory table after earlier CRs: `row_add` is blocked if the key already exists; `value_update` / `row_delete` require the key.
 - [ ] `validate_only` mode never writes any output tables.
 - [ ] `apply` mode writes new CSVs with **original filenames** and preserves exact `!N` / `*` format.
 - [ ] Key-count change is blocked unless approved in Control.
@@ -263,7 +278,7 @@ Every run writes a `.log` file containing:
 | ID  | Scenario                                      | Expected Result |
 |-----|-----------------------------------------------|-----------------|
 | T01 | Two change requests, no overlapping cells     | Change Log generated cleanly; both applied in order; new tables match expected |
-| T02 | Two change requests update the **same cell**  | Conflict detected and written to Conflicts sheet; `apply` mode refuses to run |
+| T02 | Two change requests update the **same cell**  | Conflict detected and written to Conflicts sheet; `apply` refuses while `resolved=N`. `resolved=Y` applies both in Control `order` (later CR wins) |
 | T03 | Table exists only in `before/`                | Warning recorded; no change rows generated for that table |
 | T04 | Table exists only in `after/`                 | Recorded as `table_add`; appears in new production set |
 | T05 | Column rename declared in Control             | Applied correctly; old column name disappears, new name appears |
@@ -277,7 +292,7 @@ Every run writes a `.log` file containing:
 
 ### Recommended Manual Spot-Checks
 
-- Open the generated Change Log and visually confirm a few `value_update` and `row_add` rows.
+- Open the generated Change Log index and the matching `ChangeLog_*_reviews/` workbook; visually confirm a few `value_update` and `row_add` rows.
 - Diff one output table against a manually prepared expected file.
 - Confirm the audit log contains the Control file hash and Change Log hash.
 

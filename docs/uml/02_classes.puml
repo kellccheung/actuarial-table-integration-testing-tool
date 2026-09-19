@@ -55,9 +55,13 @@ package "prophet_csv" {
     +columns: List~str~
     +data: DataFrame
     +source_path: Path?
+    +leading_dummy_lines: List~bytes~
+    +trailing_dummy_lines: List~bytes~
+    +source_encoding: str?
     --
     +key_columns: List~str~ {get}
     +value_columns: List~str~ {get}
+    +source_suffix: str {get}
     +with_key_tuple(): DataFrame
   }
 
@@ -65,7 +69,15 @@ package "prophet_csv" {
     +read_prophet_csv(path: Path): ProphetTable
     +write_prophet_csv(table: ProphetTable, path: Path): void
     +discover_csv_tables(folder: Path): Dict~str, Path~
+    +with_normalized_keys(df, key_cols): DataFrame
+    +key_str_expr(key_cols): Expr
   }
+
+  note right of prophet_csv_io
+    Recursive *.csv / *.FAC discovery.
+    Identity = posix relative path without suffix.
+    If both exist, .FAC wins.
+  end note
 }
 
 package "diff" {
@@ -83,15 +95,18 @@ package "diff" {
   }
 
   class DiffResult {
-    +change_rows: List~ChangeRow~
+    +structural_rows: List~ChangeRow~
+    +cell_changes: DataFrame
     +warnings: List~str~
     +tables_touched: Set~str~
+    --
+    +change_rows: List~ChangeRow~ {get}
   }
 
   class diff_functions <<functions>> {
     +diff_table(cr_id, table_name, before, after, control): DiffResult
-    +detect_conflicts(change_rows): List~dict~
-    +format_key_tuple(values): str
+    +detect_conflicts(structural, cell_changes): List~dict~
+    +concat_cell_changes(frames): DataFrame
   }
 
   note right of ChangeRow
@@ -100,17 +115,45 @@ package "diff" {
     column_add | column_delete | column_rename
     key_count_change | table_add
   end note
+
+  note bottom of DiffResult
+    structural_rows: table_add, key_count_change,
+    column_add / delete / rename
+    cell_changes: value_update, row_add, row_delete
+  end note
 }
 
 package "changelog" {
   class generate_change_log <<function>> {
-    +generate_change_log(control_path: Path): Path
+    +generate_change_log(control_path: Path,\n  control: ControlConfig?): Path
+  }
+}
+
+package "changelog_review" {
+  class TableContribution {
+    +change_request_id: str
+    +before: ProphetTable?
+    +after: ProphetTable?
+    +structural_rows: List~ChangeRow~
+    +cell_changes: DataFrame
+  }
+
+  class TableReviewModel {
+    +table_name: str
+    +contributions: List~TableContribution~
+  }
+
+  class changelog_review_functions <<functions>> {
+    +add_contribution(...): void
+    +group_table_reviews(reviews): Dict
+    +write_review_workbook(path, reviews, ...): void
+    +review_group_for_table(table_name): str
   }
 }
 
 package "integrate" {
   class integrate_changes <<function>> {
-    +integrate_changes(control_path: Path,\n  change_log_path: Path,\n  mode: validate_only|apply): Path
+    +integrate_changes(control_path: Path,\n  change_log_path: Path,\n  mode: validate_only|apply,\n  control: ControlConfig?): Path
   }
 }
 
@@ -127,7 +170,9 @@ package "utils" {
     +file_hash(path: Path): str
     +resolve_path(base: Path, path_str: str): Path
     +yn_to_bool(value): bool
-    +table_stem(filename): str
+    +normalize_key_part(value): str
+    +values_equal(a, b): bool
+    +format_normalized_key(values): str
   }
 }
 
@@ -135,6 +180,7 @@ ControlConfig "1" *-- "*" ChangeRequestRow
 ControlConfig "1" *-- "*" ColumnRename
 ControlConfig "1" *-- "*" KeyCountApproval
 DiffResult "1" *-- "*" ChangeRow
+TableReviewModel "1" *-- "*" TableContribution
 
 read_control ..> ControlConfig : creates
 prophet_csv_io ..> ProphetTable : creates / writes
@@ -144,11 +190,15 @@ diff_functions ..> ControlConfig : reads renames
 generate_change_log ..> read_control : uses
 generate_change_log ..> prophet_csv_io : uses
 generate_change_log ..> diff_functions : uses
+generate_change_log ..> changelog_review_functions : uses
 generate_change_log ..> audit_functions : uses
+generate_change_log ..> utils_functions : uses
+changelog_review_functions ..> TableReviewModel : builds
+changelog_review_functions ..> ProphetTable : sparse slices
 integrate_changes ..> read_control : uses
 integrate_changes ..> prophet_csv_io : uses
+integrate_changes ..> ChangeRow : applies
 integrate_changes ..> audit_functions : uses
 integrate_changes ..> utils_functions : uses
-generate_change_log ..> utils_functions : uses
 
 @enduml

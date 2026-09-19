@@ -9,7 +9,7 @@ You drive the tool with an Excel **Control** workbook. The tool compares `before
 ## Requirements
 
 - **Anaconda or Miniconda** — day-to-day users do not need a separate Python install
-- Shared Conda env `prophet-table` from [`environment.yml`](environment.yml) (Python **3.11**, `polars`, `openpyxl`, `xlsxwriter`)
+- Shared Conda env `prophet-table` from [`environment.yml`](environment.yml) (Python **3.11**, **polars 1.44.2**, `openpyxl`, `xlsxwriter`)
 - [`requirements.txt`](requirements.txt) remains available for pip / pytest workflows (pytest is not in the day-to-day Conda env)
 
 `Setup.bat` / `Run.bat` look for `conda` on PATH and in common install folders. If they still cannot find Conda, open **Anaconda Prompt**, `cd` to this project folder, and run the `.bat` from there.
@@ -22,7 +22,7 @@ You drive the tool with an Excel **Control** workbook. The tool compares `before
 2. Set up a working folder (see [Folder layout](#folder-layout)) and fill in `Control.xlsx` (see [Control workbook](#control-workbook)).
 3. Set `mode` in the Control `Config` sheet (`generate_changelog`, `validate_only`, or `apply`).
 4. Double-click [`Run.bat`](Run.bat), or drag `Control.xlsx` onto it, and confirm the Control path if prompted.
-5. For Stage 2 (`validate_only` / `apply`), ensure a Change Log already exists in `Output\` (from Stage 1). `Run.bat` auto-picks the newest `ChangeLog_*.xlsx` there.
+5. For Stage 2 (`validate_only` / `apply`), ensure a Change Log already exists in `Output\` (from Stage 1). When prompted, leave **Change Log** blank to use the newest `ChangeLog_*.xlsx` there, or type a path / filename to pin a specific file. (Stage 1 can leave this blank.) You can also pass the Change Log as a second argument: `Run.bat Control.xlsx ChangeLog_YYYYMMDD_HHMMSS.xlsx`.
 
 Typical sequence: set `mode` to `generate_changelog` → run → review the Change Log → set `mode` to `validate_only` → run → set `mode` to `apply` → run.
 
@@ -34,14 +34,14 @@ From the project root, with the `prophet-table` env active (or via `conda run -n
 # Stage 1 – generate Change Log
 python -m prophet_table_tool path\to\Control.xlsx --mode generate_changelog
 
-# Stage 2 – dry run (no new tables written)
-python -m prophet_table_tool path\to\Control.xlsx --mode validate_only --change-log path\to\Output\ChangeLog_YYYYMMDD_HHMMSS.xlsx
+# Stage 2 – dry run (no new tables written); omit --change-log to use the newest in Output
+python -m prophet_table_tool path\to\Control.xlsx --mode validate_only
 
-# Stage 2 – apply changes
-python -m prophet_table_tool path\to\Control.xlsx --mode apply --change-log path\to\Output\ChangeLog_YYYYMMDD_HHMMSS.xlsx
+# Stage 2 – apply a specific Change Log (full path, or filename under Output)
+python -m prophet_table_tool path\to\Control.xlsx --mode apply --change-log ChangeLog_YYYYMMDD_HHMMSS.xlsx
 ```
 
-`--mode` overrides the `mode` value in the Control `Config` sheet. If you omit `--mode` (as `Run.bat` does), the tool uses whatever is set in Control.
+`--mode` overrides the `mode` value in the Control `Config` sheet. If you omit `--mode` (as `Run.bat` does), the tool uses whatever is set in Control. For Stage 2, `--change-log` is optional: omit it to auto-pick the newest `ChangeLog_*.xlsx` in `Output\`.
 
 ---
 
@@ -65,6 +65,11 @@ WorkingRoot/
 │   └── *.csv
 └── Output/                               ← created/updated by the tool
     ├── ChangeLog_YYYYMMDD_HHMMSS.xlsx
+    ├── ChangeLog_YYYYMMDD_HHMMSS_Detail.csv
+    ├── ChangeLog_YYYYMMDD_HHMMSS_reviews/  ← per-folder human review workbooks
+    │   ├── root.xlsx
+    │   ├── BE.xlsx
+    │   └── IFRS.xlsx
     ├── IntegrationReport_YYYYMMDD_HHMMSS.xlsx
     ├── New_Production_Tables/            ← written only in apply mode
     └── Audit/
@@ -157,13 +162,19 @@ Compares `before/` vs `after/` for every included change request (including
 tables in **subfolders**; identity is the relative path, e.g. `SubA/MORT_TABLE`)
 and writes:
 
-- `Output/ChangeLog_<run_id>.xlsx` — Summary, Conflicts, and per-table review sheets
+- `Output/ChangeLog_<run_id>.xlsx` — Summary, Conflicts, and a **ReviewFiles** index (Stage 2 uses this file plus the Detail CSV)
 - `Output/ChangeLog_<run_id>_Detail.csv` — machine-readable change rows used by Stage 2
+- `Output/ChangeLog_<run_id>_reviews/<group>.xlsx` — human-review workbooks split by first-level production-table folder (`root` for tables at the top, `BE` for `BE/...`, `IFRS` for `IFRS/...`, and so on)
 
-Workbook sheets:
+Canonical workbook sheets:
 
 - **Summary** — per-CR counts and conflict flags
 - **Conflicts** — one row per overlap or gap (see [Conflicts](#conflicts))
+- **ReviewFiles** — maps each table to its folder review workbook
+
+Folder review workbooks:
+
+- **Conflicts** — rows whose `table_name` belongs to that folder
 - **One sheet per touched table** — human review only (changed rows); Stage 2 ignores these sheets. The `_change` column shows `[change_request_id]` for each changed row, with an `ADD` / `DELETE` prefix when the row was added or removed.
 
 Value comparison is **numeric-aware** (`1.10` equals `1.1`). CSV files are read
@@ -173,20 +184,23 @@ with encoding fallback: utf-8-sig → utf-8 → cp1252 → latin-1.
 python -m prophet_table_tool WorkingRoot\Control.xlsx --mode generate_changelog
 ```
 
-**Review the Change Log before continuing.** Prefer the per-table review tabs for visual checks; use the Detail CSV / Conflicts for the machine-readable record. If the Conflicts sheet has rows, resolve them before applying (see [Conflicts](#conflicts)).
+**Review the Change Log before continuing.** Prefer the per-folder review workbooks under `ChangeLog_*_reviews/` for visual checks; use the Detail CSV / Conflicts for the machine-readable record. If the Conflicts sheet has rows, resolve them before applying (see [Conflicts](#conflicts)).
 
 ### Stage 2 — Validate only (dry run)
 
-Checks that the Change Log can be applied cleanly against current production:
+Checks that the Change Log can be applied cleanly against current production, **in Control `order`**:
 
 - Referenced tables exist (except pure `table_add`)
-- `value_update` / `row_delete` keys exist in production (`old_value` is not required to match)
+- Each CR is validated against the in-memory table **after earlier CRs** have been applied (simulated; no files written)
+- `value_update` / `row_delete` keys must exist in that current table (`old_value` is not required to match)
+- `row_add` keys must **not** already exist in that current table (no duplicate rows)
 - Column renames are declared; key-count changes are approved
 - Unresolved conflicts are listed as FAIL rows (see [Conflicts](#conflicts))
 
 Writes `Output/IntegrationReport_<run_id>.xlsx` and an audit log. **Does not write** any files under `New_Production_Tables/`.
 
 ```bash
+python -m prophet_table_tool WorkingRoot\Control.xlsx --mode validate_only
 python -m prophet_table_tool WorkingRoot\Control.xlsx --mode validate_only --change-log WorkingRoot\Output\ChangeLog_YYYYMMDD_HHMMSS.xlsx
 ```
 
@@ -199,7 +213,8 @@ Same validation as above. If everything passes, writes updated CSVs to:
 Filenames and `!N` / `*` format are preserved. Production input files are not overwritten in place.
 
 ```bash
-python -m prophet_table_tool WorkingRoot\Control.xlsx --mode apply --change-log WorkingRoot\Output\ChangeLog_YYYYMMDD_HHMMSS.xlsx
+python -m prophet_table_tool WorkingRoot\Control.xlsx --mode apply
+python -m prophet_table_tool WorkingRoot\Control.xlsx --mode apply --change-log ChangeLog_YYYYMMDD_HHMMSS.xlsx
 ```
 
 Stage 2 only processes change requests with **`include = Y` and `approved = Y`**, in `order` sequence.
@@ -218,7 +233,7 @@ A conflict is ignored in Stage 2 only if you mark `resolved=Y`, delete that Conf
 
 | Type | Raised when | Typical example |
 |------|-------------|-----------------|
-| `cell_overlap` | Two or more CRs touch the **same cell** (same table + same key combination + same column) with `value_update`, `row_add`, or `row_delete`. Flagged even when both CRs write the same `new_value`. | CR_A and CR_B both change `Rate` for `Age=20, Duration=1, Product=PROD_A`. |
+| `cell_overlap` | Two or more CRs touch the **same cell** (same table + same key combination + same column) with `value_update`, `row_add`, or `row_delete`. Still flagged when both CRs write the same `new_value` (numeric-aware: `1.10` equals `1.1`), and when a `row_add` or `column_add` is followed by a `value_update`. Set `resolved=Y` to apply both in Control `order` (later CR wins). | CR_A and CR_B both change `Rate` for `Age=20, Duration=1, Product=PROD_A`. |
 | `structural_collision` | Two or more CRs apply **structural** changes to the **same table**. Structural types: `column_add`, `column_delete`, `column_rename`, `key_count_change`, `table_add`. Different columns still collide if they are on the same table. | CR_A adds a column and CR_B renames another column on `MORT_TABLE`. |
 | `missing_row_column_fill` | A `row_add` and a `column_add` on the same table leave their **intersection cell** with no covering `row_add` / `value_update` in the Detail CSV. Can be one CR or several. | CR_A adds a new age row; CR_B adds `NewCol`; neither supplies a value for that new row × `NewCol`. |
 
@@ -229,13 +244,25 @@ Not a conflict (handled elsewhere): a table only in `before/` (warning + skip), 
 1. Open `Output/ChangeLog_*.xlsx`.
 2. **Summary** — any CR with `has_conflict = Y`.
 3. **Conflicts** — one row per issue: type, table, key, column, CR ids, old/new values, notes, `resolved`.
-4. **Per-table review tabs** — useful for `cell_overlap`: `_change` names the related CR(s); changed cells show `old -> new` and `[change_request_id]` when more than one CR touches the table. These tabs are human review only; Stage 2 does not read them.
+4. **ReviewFiles** — which folder workbook holds each table.
+5. **Per-folder review workbooks** (`ChangeLog_*_reviews/<group>.xlsx`) — useful for `cell_overlap`: `_change` names the related CR(s); changed cells show `old -> new` and `[change_request_id]` when more than one CR touches the table. These sheets are human review only; Stage 2 does not read them.
 
 ### How to resolve them
 
 Prefer fixing the **source** (Control and/or `before/` / `after/`) and **re-running Stage 1**. Regenerating the Change Log rebuilds Conflicts from scratch (`resolved` resets to `N` if the overlap is still present).
 
-**`cell_overlap`** — decide which CR should win, then do one of:
+**`cell_overlap`** — still listed with `resolved=N`. Conflicts `notes` say whether the `new_value`s agree, and whether this is a sequenced `row_add` / `column_add` plus `value_update`.
+
+Set `resolved = Y` to accept the overlap and apply **both** remaining Detail rows in Control `order`. The **later** CR’s value is the one that remains in the cell. You do not have to delete a Detail row when the values differ.
+
+Typical cases:
+
+- **Same `new_value`** (numeric-aware): keep both Detail rows and set `resolved = Y`.
+- **`row_add` then `value_update`** (CR_B’s `before/` already includes the new row): `notes` mention `row_add and value_update`. Set `resolved = Y`. Do **not** model the follow-on as a second `row_add` of the same key: even with `resolved = Y`, Stage 2 fails `row_add` when the key already exists.
+- **`column_add` then `value_update`** (CR_B’s `before/` already includes the new column): `notes` mention `column_add and value_update`. Set `resolved = Y`. CR_A adds the column; CR_B’s later value stays.
+- **Independent updates with different `new_value`s**: you may still exclude a CR or edit Detail to pick a winner; or just set `resolved = Y` and accept Control-order last-writer-wins.
+
+To drop one CR’s change instead of last-writer-wins:
 
 - Set `include = N` on the losing CR in Control and re-run Stage 1 (cleanest).
 - Edit that CR’s `before/` / `after/` so it no longer changes the cell, then re-run Stage 1.
@@ -250,7 +277,7 @@ Prefer fixing the **source** (Control and/or `before/` / `after/`) and **re-runn
 
 ### Marking `resolved = Y`
 
-On the Conflicts sheet, change `resolved` from `N` to `Y` (also accepted: `YES`, `TRUE`, `1`). Use this only after you have decided the outcome — edited Detail, excluded CRs, merged folders, or confirmed a blank fill.
+On the Conflicts sheet, change `resolved` from `N` to `Y` (also accepted: `YES`, `TRUE`, `1`). Use this only after you have decided the outcome — accepted last-writer-wins in Control `order` (including same-value overlap, sequenced `row_add`/`column_add` then `value_update`, or differing independent updates), edited Detail, excluded CRs, merged folders, or confirmed a blank fill.
 
 Then run `validate_only`, and only then `apply`.
 
@@ -260,7 +287,9 @@ Then run `validate_only`, and only then `apply`.
 
 | Output | When |
 |--------|------|
-| `ChangeLog_*.xlsx` | Stage 1 |
+| `ChangeLog_*.xlsx` | Stage 1 (Summary / Conflicts / ReviewFiles index) |
+| `ChangeLog_*_Detail.csv` | Stage 1 (Stage 2 source of truth) |
+| `ChangeLog_*_reviews/*.xlsx` | Stage 1 (human review, split by first-level folder) |
 | `IntegrationReport_*.xlsx` | Stage 2 |
 | `New_Production_Tables/*.csv` | Stage 2 `apply` only |
 | `Output/Audit/*.log` | Every run |
@@ -274,6 +303,8 @@ Each audit log records timestamp, mode, Control/Change Log hashes, CRs processed
 | Situation | Behaviour |
 |-----------|-----------|
 | Unresolved conflicts in Change Log | Hard stop in `apply` (see [Conflicts](#conflicts)) |
+| `row_add` whose key already exists in the current table | Hard stop (including a second CR `row_add` of a key an earlier CR just added) |
+| `value_update` / `row_delete` whose key is not in the current table | Hard stop (a follow-on update is valid only after an earlier CR has added that row, and Conflicts `resolved=Y` if they overlap) |
 | Key-count change without approval | Hard stop |
 | Column rename not listed in `ColumnRenames` | Hard stop |
 | Production value ≠ Change Log `old_value` | Allowed — `new_value` is still applied |
@@ -290,7 +321,7 @@ Matching is **exact string** only. Re-running the same Change Log on the same pr
 2. For each change request, drop baseline tables in `before/` and revised tables in `after/`.
 3. Register each CR in Control (`include` / `approved` / `order`).
 4. Declare any column renames; approve any key-count changes.
-5. Run Stage 1 → review Summary, per-table tabs, Detail, and Conflicts. Resolve any Conflicts rows before Stage 2 (see [Conflicts](#conflicts)).
+5. Run Stage 1 → review Summary, Conflicts, ReviewFiles, and the per-folder review workbooks. Resolve any Conflicts rows before Stage 2 (see [Conflicts](#conflicts)).
 6. Run `validate_only` → fix any validation failures.
 7. Run `apply` → take `New_Production_Tables/` as the candidate production set.
 8. Keep the Change Log, Integration Report, and Audit logs with the quarter’s records.
@@ -305,6 +336,8 @@ Optional self-check after install (uses pip/`requirements.txt`, including pytest
 python -m pip install -r requirements.txt
 python fixtures/build_acceptance_fixtures.py
 python -m pytest tests/ -q
+# large-table timing (50k rows by default; override with PROPHET_TIMING_ROWS)
+python -m pytest tests/test_large_table_timing.py -s
 ```
 
 Detailed behaviour and acceptance cases (T01–T12) are documented in [`Prophet_Table_Change_Tool_Function_Doc.md`](Prophet_Table_Change_Tool_Function_Doc.md).
@@ -318,7 +351,7 @@ Detailed behaviour and acceptance cases (T01–T12) are documented in [`Prophet_
 | `conda was not found` / Setup fails | Install Anaconda/Miniconda and ensure `conda` is on PATH |
 | Env `prophet-table` missing | Run `Setup.bat` once |
 | `Unknown mode` / wrong behaviour | `Config.mode` or pass `--mode` explicitly |
-| `--change-log is required` / no Change Log found | Stage 2 needs a `ChangeLog_*.xlsx` in `Output\` (run Stage 1 first); CLI needs `--change-log` |
+| no Change Log found in Output | Stage 2 needs a `ChangeLog_*.xlsx` in `Output\` (run Stage 1 first), or pass `--change-log` / type a path or filename when prompted |
 | Change request not processed | Folder name = `change_request_id`; Stage 2 needs `include=Y` **and** `approved=Y` |
 | Empty Change Log for a table | Confirm CSVs are under `before/` and `after/` with matching names |
 | Apply refused after conflict | Open the Change Log **Conflicts** sheet and follow [Conflicts](#conflicts). `apply` stops until every remaining row is `resolved=Y` or no longer involves an included+approved CR |

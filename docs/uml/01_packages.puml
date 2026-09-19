@@ -9,6 +9,7 @@ package "prophet_table_tool" {
 
   package "Stage 1" {
     [changelog\ngenerate_change_log()] as GCL
+    [changelog_review\nper-folder review xlsx] as REV
   }
 
   package "Stage 2" {
@@ -26,35 +27,43 @@ package "prophet_table_tool" {
 
 package "External I/O" {
   database "Control.xlsx" as CTRLX
-  folder "ChangeRequests/*/before|after/*.csv" as BA
-  folder "Production_Tables/*.csv" as PROD
+  folder "ChangeRequests/**/before|after\n*.csv / *.FAC" as BA
+  folder "Production_Tables/**\n*.csv / *.FAC" as PROD
   file "Output/ChangeLog_*.xlsx" as CLOG
+  file "Output/ChangeLog_*_Detail.csv" as DETAIL
+  folder "Output/ChangeLog_*_reviews/" as REVOUT
   file "Output/IntegrationReport_*.xlsx" as RPT
-  folder "Output/New_Production_Tables/*.csv" as NEW
+  folder "Output/New_Production_Tables/" as NEW
   folder "Output/Audit/*.log" as LOGS
 }
 
 CLI --> GCL
 CLI --> INT
+CLI --> CTRL
 
 GCL --> CTRL
 GCL --> CSV
 GCL --> DIFF
+GCL --> REV
 GCL --> AUDIT
 GCL --> UTILS
 
 INT --> CTRL
 INT --> CSV
+INT --> DIFF
 INT --> AUDIT
 INT --> UTILS
 
 GCL --> CTRLX
 GCL --> BA
 GCL --> CLOG
+GCL --> DETAIL
+GCL --> REVOUT
 GCL --> LOGS
 
 INT --> CTRLX
 INT --> CLOG
+INT --> DETAIL
 INT --> PROD
 INT --> RPT
 INT --> NEW

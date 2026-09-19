@@ -1,0 +1,68 @@
+@startuml prophet_table_tool_stage1_diff_table
+title Stage 1 -- diff_table (before vs after for one table)
+skinparam shadowing false
+skinparam ActivityBackgroundColor White
+skinparam ActivityBorderColor Black
+skinparam ActivityDiamondBackgroundColor White
+
+start
+note right
+  structural_rows: table_add, key_count_change,
+  column_rename / add / delete
+  cell_changes: row_add, row_delete, value_update
+end note
+
+if (before missing and after present?) then (yes)
+  :Emit table_add (structural);
+  :Emit row_add (one cell row per column);
+  stop
+elseif (after missing?) then (yes)
+  :Warning: skip (no automatic deletes);
+  stop
+else (both present)
+endif
+
+:Mark table as touched;
+
+if (n_keys before != after?) then (yes)
+  :Emit key_count_change;
+else (no)
+endif
+
+:Load declared ColumnRenames for this CR + table\n(never auto-detected);
+:Emit column_rename for each declaration;
+:Map before column names via rename;
+:Emit column_add (after minus mapped before);
+:Emit column_delete (before not renamed and not in after);
+:Align before schema to after names;
+
+if (key count differs and\nno shared key columns remain?) then (yes)
+  stop
+else (no)
+endif
+
+:Normalize keys (numeric-aware);
+:Split keys: added / deleted / common;
+
+if (added keys?) then (yes)
+  :Emit row_add cells from after;
+else (no)
+endif
+
+if (deleted keys?) then (yes)
+  :Emit row_delete cells from before;
+else (no)
+endif
+
+if (common keys and common value columns?) then (yes)
+  :Join on key and emit value_update\nwhere cells differ (string or float equality);
+else (no)
+endif
+
+if (genuinely new columns on common keys?) then (yes)
+  :Emit value_update\n(old empty, notes = Value on newly added column);
+else (no)
+endif
+
+stop
+@enduml

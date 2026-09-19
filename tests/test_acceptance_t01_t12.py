@@ -92,11 +92,18 @@ def test_t01_two_crs_no_overlap():
 
     wb_clog = load_workbook(clog, data_only=True)
     assert "ChangeLog_Detail" not in wb_clog.sheetnames
-    assert "MORT_TABLE" in wb_clog.sheetnames
-    assert "EXPENSE_TABLE" in wb_clog.sheetnames
-    mort_rows = list(wb_clog["MORT_TABLE"].iter_rows(values_only=True))
-    expense_rows = list(wb_clog["EXPENSE_TABLE"].iter_rows(values_only=True))
+    assert "ReviewFiles" in wb_clog.sheetnames
+    assert "MORT_TABLE" not in wb_clog.sheetnames
+    assert "EXPENSE_TABLE" not in wb_clog.sheetnames
     wb_clog.close()
+
+    review = clog.parent / f"{clog.stem}_reviews" / "root.xlsx"
+    wb_rev = load_workbook(review, data_only=True)
+    assert "MORT_TABLE" in wb_rev.sheetnames
+    assert "EXPENSE_TABLE" in wb_rev.sheetnames
+    mort_rows = list(wb_rev["MORT_TABLE"].iter_rows(values_only=True))
+    expense_rows = list(wb_rev["EXPENSE_TABLE"].iter_rows(values_only=True))
+    wb_rev.close()
     mort_header = next(r for r in mort_rows if r and r[0] == "_change")
     assert list(mort_header[1:4]) == ["Age", "Duration", "Product"]
     header_idx = mort_rows.index(mort_header)

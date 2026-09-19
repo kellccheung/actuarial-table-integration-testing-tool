@@ -4,45 +4,41 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
 
-from openpyxl.styles import Font, PatternFill
-from openpyxl.workbook.workbook import Workbook
-from openpyxl.worksheet.worksheet import Worksheet
+import polars as pl
+import xlsxwriter
 
-from .diff import ChangeRow
-from .prophet_csv import ProphetTable
+from .diff import ChangeRow, STRUCTURAL_TYPES, empty_cell_changes, rows_to_cell_df
+from .prophet_csv import ProphetTable, with_normalized_keys
 
-STRUCTURAL_TYPES = frozenset(
-    {
-        "column_add",
-        "column_delete",
-        "column_rename",
-        "key_count_change",
-        "table_add",
-    }
+RESERVED_SHEET_NAMES = frozenset(
+    {"Summary", "ChangeLog_Detail", "Conflicts", "ReviewFiles"}
 )
 
-RESERVED_SHEET_NAMES = frozenset({"Summary", "ChangeLog_Detail", "Conflicts"})
+ROOT_GROUP = "root"
 
 _CHANGE_COL = "_change"
 
-
-def _changed_keys_from_rows(change_rows: list[ChangeRow]) -> set[str]:
-    """Keys that appear in row_add / row_delete / value_update (for sparse reviews)."""
-    keys: set[str] = set()
-    for row in change_rows:
-        if row.change_type in {"row_add", "row_delete", "value_update"} and row.key_tuple:
-            keys.add(row.key_tuple)
-    return keys
-
-
-_FILL_UPDATE = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
-_FILL_ADD = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
-_FILL_DELETE = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
-_FILL_NOTE = PatternFill(start_color="DDEBF7", end_color="DDEBF7", fill_type="solid")
-_FILL_HEADER = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
-
 _INVALID_SHEET_CHARS = re.compile(r"[\\/*?:\[\]]")
+_INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*]')
+
+
+def _changed_keys_from_cells(cell_changes: pl.DataFrame) -> set[str]:
+    """Keys that appear in row_add / row_delete / value_update (for sparse reviews)."""
+    if cell_changes.is_empty():
+        return set()
+    keys = (
+        cell_changes.filter(
+            pl.col("change_type").is_in(["row_add", "row_delete", "value_update"])
+            & (pl.col("key_tuple") != "")
+        )
+        .get_column("key_tuple")
+        .unique()
+        .to_list()
+    )
+    return {str(k) for k in keys}
 
 
 @dataclass
@@ -50,7 +46,8 @@ class TableContribution:
     change_request_id: str
     before: ProphetTable | None
     after: ProphetTable | None
-    change_rows: list[ChangeRow]
+    structural_rows: list[ChangeRow] = field(default_factory=list)
+    cell_changes: pl.DataFrame = field(default_factory=empty_cell_changes)
 
 
 @dataclass
@@ -84,6 +81,16 @@ class ReviewGrid:
     multi_cr: bool
 
 
+@dataclass
+class _ReviewFormats:
+    bold: Any
+    header: Any
+    note: Any
+    add: Any
+    delete: Any
+    update: Any
+
+
 def add_contribution(
     reviews: dict[str, TableReviewModel],
     table_name: str,
@@ -91,21 +98,81 @@ def add_contribution(
     before: ProphetTable | None,
     after: ProphetTable | None,
     change_rows: list[ChangeRow],
+    cell_changes: pl.DataFrame | None = None,
 ) -> None:
     """Accumulate one CR's before/after snapshot for a table into the review map."""
-    table_rows = [r for r in change_rows if r.table_name == table_name]
-    if not table_rows and before is None and after is None:
+    structural = [r for r in change_rows if r.table_name == table_name and r.change_type in STRUCTURAL_TYPES]
+    if cell_changes is None:
+        cells = rows_to_cell_df(
+            [r for r in change_rows if r.table_name == table_name and r.change_type in {"value_update", "row_add", "row_delete"}]
+        )
+    else:
+        cells = cell_changes
+        if cells.height and "table_name" in cells.columns:
+            cells = cells.filter(pl.col("table_name") == table_name)
+
+    if not structural and cells.is_empty() and before is None and after is None:
         return
+
+    wanted = _changed_keys_from_cells(cells)
     if table_name not in reviews:
         reviews[table_name] = TableReviewModel(table_name=table_name)
     reviews[table_name].contributions.append(
         TableContribution(
             change_request_id=change_request_id,
-            before=before,
-            after=after,
-            change_rows=table_rows,
+            before=_slice_table(before, wanted),
+            after=_slice_table(after, wanted),
+            structural_rows=structural,
+            cell_changes=cells,
         )
     )
+
+
+def _slice_table(table: ProphetTable | None, wanted: set[str]) -> ProphetTable | None:
+    """Keep schema plus changed keys only (full table is not needed for review)."""
+    if table is None:
+        return None
+    if not wanted:
+        return ProphetTable(
+            n_keys=table.n_keys,
+            columns=list(table.columns),
+            data=table.data.head(0),
+            source_path=table.source_path,
+            source_encoding=table.source_encoding,
+        )
+    keyed = with_normalized_keys(table.data, table.key_columns)
+    sliced = keyed.filter(pl.col("_key_str").is_in(list(wanted))).drop("_key_str")
+    return ProphetTable(
+        n_keys=table.n_keys,
+        columns=list(table.columns),
+        data=sliced.select(table.columns),
+        source_path=table.source_path,
+        source_encoding=table.source_encoding,
+    )
+
+
+def review_group_for_table(table_name: str) -> str:
+    """First path segment of a table identity, or ``root`` if it has no folder."""
+    name = str(table_name).replace("\\", "/").strip("/")
+    if not name or "/" not in name:
+        return ROOT_GROUP
+    return name.split("/", 1)[0]
+
+
+def sanitize_group_filename(group: str) -> str:
+    """Make a first-level group name safe as an ``.xlsx`` stem."""
+    cleaned = _INVALID_FILENAME_CHARS.sub("_", group).strip(" .") or ROOT_GROUP
+    return cleaned
+
+
+def group_table_reviews(
+    reviews: dict[str, TableReviewModel],
+) -> dict[str, dict[str, TableReviewModel]]:
+    """Partition review models by first-level production-table folder."""
+    grouped: dict[str, dict[str, TableReviewModel]] = {}
+    for table_name, model in reviews.items():
+        grouped.setdefault(review_group_for_table(table_name), {})[table_name] = model
+    return grouped
 
 
 def build_review_grid(model: TableReviewModel) -> ReviewGrid | None:
@@ -139,20 +206,67 @@ def build_review_grid(model: TableReviewModel) -> ReviewGrid | None:
     )
 
 
+def write_review_workbook(
+    path: Path,
+    reviews: dict[str, TableReviewModel],
+    *,
+    conflict_headers: list[str] | None = None,
+    conflict_rows: list[list] | None = None,
+) -> None:
+    """Write Conflicts (optional) plus one review sheet per table via xlsxwriter."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    wb = xlsxwriter.Workbook(str(path), {"constant_memory": True})
+    try:
+        formats = _make_formats(wb)
+        used_names: set[str] = set(RESERVED_SHEET_NAMES)
+        if conflict_headers is not None:
+            _write_conflicts_sheet(
+                wb, formats, conflict_headers, conflict_rows or []
+            )
+        for table_name in sorted(reviews):
+            grid = build_review_grid(reviews[table_name])
+            if grid is None:
+                continue
+            sheet_name = _unique_sheet_name(table_name, used_names)
+            used_names.add(sheet_name)
+            ws = wb.add_worksheet(sheet_name)
+            _write_review_sheet(ws, grid, formats)
+    finally:
+        wb.close()
+
+
 def write_review_sheets(
-    wb: Workbook,
+    path: Path,
     reviews: dict[str, TableReviewModel],
 ) -> None:
-    """Append one review sheet per table to the Change Log workbook."""
-    used_names: set[str] = set(wb.sheetnames) | set(RESERVED_SHEET_NAMES)
-    for table_name in sorted(reviews):
-        grid = build_review_grid(reviews[table_name])
-        if grid is None:
-            continue
-        sheet_name = _unique_sheet_name(table_name, used_names)
-        used_names.add(sheet_name)
-        ws = wb.create_sheet(sheet_name)
-        _write_review_sheet(ws, grid)
+    """Write per-table review sheets to a standalone workbook (no Conflicts tab)."""
+    write_review_workbook(path, reviews)
+
+
+def _make_formats(wb: xlsxwriter.Workbook) -> _ReviewFormats:
+    return _ReviewFormats(
+        bold=wb.add_format({"bold": True}),
+        header=wb.add_format({"bold": True, "bg_color": "D9D9D9"}),
+        note=wb.add_format({"bg_color": "DDEBF7"}),
+        add=wb.add_format({"bg_color": "C6EFCE"}),
+        delete=wb.add_format({"bg_color": "FFC7CE"}),
+        update=wb.add_format({"bg_color": "FFF2CC"}),
+    )
+
+
+def _write_conflicts_sheet(
+    wb: xlsxwriter.Workbook,
+    formats: _ReviewFormats,
+    headers: list[str],
+    rows: list[list],
+) -> None:
+    ws = wb.add_worksheet("Conflicts")
+    for j, header in enumerate(headers):
+        ws.write(0, j, header, formats.header)
+    for i, row in enumerate(rows, start=1):
+        for j, val in enumerate(row):
+            ws.write(i, j, val)
 
 
 def _resolve_columns(model: TableReviewModel) -> list[str]:
@@ -165,12 +279,19 @@ def _resolve_columns(model: TableReviewModel) -> list[str]:
             if col not in columns:
                 columns.append(col)
     # Also pick up columns mentioned only in change rows (e.g. column_add with empty table)
+    extra: list[str] = []
     for contrib in model.contributions:
-        for row in contrib.change_rows:
-            if row.change_type in {"column_add", "value_update", "row_add", "row_delete"}:
-                if row.column_name and row.column_name not in columns:
-                    if "->" not in row.column_name:
-                        columns.append(row.column_name)
+        for row in contrib.structural_rows:
+            if row.change_type == "column_add" and row.column_name and row.column_name not in columns:
+                extra.append(row.column_name)
+        if contrib.cell_changes.height:
+            for col in contrib.cell_changes.get_column("column_name").unique().to_list():
+                name = str(col or "")
+                if name and name not in columns and "->" not in name:
+                    extra.append(name)
+    for col in extra:
+        if col not in columns:
+            columns.append(col)
     return columns
 
 
@@ -179,9 +300,7 @@ def _structural_notes(model: TableReviewModel) -> list[str]:
     seen: set[str] = set()
     for contrib in model.contributions:
         cr = contrib.change_request_id
-        for row in contrib.change_rows:
-            if row.change_type not in STRUCTURAL_TYPES:
-                continue
+        for row in contrib.structural_rows:
             text = _format_structural_note(row, cr)
             if text not in seen:
                 seen.add(text)
@@ -207,9 +326,16 @@ def _format_structural_note(row: ChangeRow, cr_id: str) -> str:
     return f"{prefix}{row.change_type} - {row.column_name or row.notes}"
 
 
-def _table_row_dict(table: ProphetTable) -> dict[str, dict[str, str]]:
-    """Map key_str → {col: value} for all rows in a Prophet table."""
-    keyed = table.with_key_tuple()
+def _table_row_dict(
+    table: ProphetTable,
+    wanted: set[str] | None = None,
+) -> dict[str, dict[str, str]]:
+    """Map key_str → {col: value}, optionally restricted to ``wanted`` keys."""
+    if wanted is not None and not wanted:
+        return {}
+    keyed = with_normalized_keys(table.data, table.key_columns)
+    if wanted is not None:
+        keyed = keyed.filter(pl.col("_key_str").is_in(list(wanted)))
     out: dict[str, dict[str, str]] = {}
     for row in keyed.iter_rows(named=True):
         key_str = row["_key_str"]
@@ -233,15 +359,13 @@ def _seed_rows(
     row_map: dict[str, _ReviewRow] = {}
     wanted: set[str] = set()
     for contrib in model.contributions:
-        wanted |= _changed_keys_from_rows(contrib.change_rows)
+        wanted |= _changed_keys_from_cells(contrib.cell_changes)
 
     # Prefer after values for wanted keys
     for contrib in model.contributions:
         if contrib.after is None:
             continue
-        for key_str, values in _table_row_dict(contrib.after).items():
-            if key_str not in wanted:
-                continue
+        for key_str, values in _table_row_dict(contrib.after, wanted).items():
             if key_str not in row_map:
                 row_map[key_str] = _ReviewRow(
                     key_str=key_str,
@@ -257,9 +381,7 @@ def _seed_rows(
     for contrib in model.contributions:
         if contrib.before is None:
             continue
-        for key_str, values in _table_row_dict(contrib.before).items():
-            if key_str not in wanted:
-                continue
+        for key_str, values in _table_row_dict(contrib.before, wanted).items():
             if key_str not in row_map:
                 row_map[key_str] = _ReviewRow(
                     key_str=key_str,
@@ -290,96 +412,88 @@ def _apply_change_annotations(
     row_map: dict[str, _ReviewRow],
     columns: list[str],
 ) -> None:
+    col_set = set(columns)
     for contrib in model.contributions:
         cr = contrib.change_request_id
-        add_keys: set[str] = set()
-        delete_keys: set[str] = set()
+        cells = contrib.cell_changes
+        if cells.is_empty():
+            continue
 
-        for row in contrib.change_rows:
-            if row.change_type == "row_add" and row.key_tuple:
-                add_keys.add(row.key_tuple)
-            elif row.change_type == "row_delete" and row.key_tuple:
-                delete_keys.add(row.key_tuple)
+        add_vals: dict[str, dict[str, str]] = {}
+        delete_vals: dict[str, dict[str, str]] = {}
+        updates: list[tuple[str, str, str, str]] = []
 
-        for key_str in add_keys:
+        for rec in cells.select(
+            ["change_type", "key_tuple", "column_name", "old_value", "new_value"]
+        ).iter_rows(named=True):
+            key_str = str(rec["key_tuple"] or "")
+            col = str(rec["column_name"] or "")
+            ct = rec["change_type"]
+            if ct == "row_add" and key_str:
+                add_vals.setdefault(key_str, {})
+                if col:
+                    add_vals[key_str][col] = "" if rec["new_value"] is None else str(rec["new_value"])
+            elif ct == "row_delete" and key_str:
+                delete_vals.setdefault(key_str, {})
+                if col:
+                    delete_vals[key_str][col] = "" if rec["old_value"] is None else str(rec["old_value"])
+            elif ct == "value_update" and key_str and col:
+                updates.append(
+                    (
+                        key_str,
+                        col,
+                        "" if rec["old_value"] is None else str(rec["old_value"]),
+                        "" if rec["new_value"] is None else str(rec["new_value"]),
+                    )
+                )
+
+        for key_str, col_vals in add_vals.items():
             review_row = row_map.get(key_str)
             if review_row is None:
-                # Reconstruct from row_add change cells
-                values = {c: "" for c in columns}
-                for r in contrib.change_rows:
-                    if (
-                        r.change_type == "row_add"
-                        and r.key_tuple == key_str
-                        and r.column_name in values
-                    ):
-                        values[r.column_name] = r.new_value
+                values = {c: col_vals.get(c, "") for c in columns}
                 review_row = _ReviewRow(key_str=key_str, status="ADD", values=values)
                 row_map[key_str] = review_row
             else:
                 if review_row.status != "DELETE":
                     review_row.status = "ADD"
+                for c, v in col_vals.items():
+                    if c in review_row.values:
+                        review_row.values[c] = v
             _record_source_cr(review_row, cr)
 
-            # Fill values from row_add cells
-            for r in contrib.change_rows:
-                if (
-                    r.change_type == "row_add"
-                    and r.key_tuple == key_str
-                    and r.column_name in review_row.values
-                ):
-                    review_row.values[r.column_name] = r.new_value
-
-        for key_str in delete_keys:
+        for key_str, col_vals in delete_vals.items():
             review_row = row_map.get(key_str)
             if review_row is None:
-                values = {c: "" for c in columns}
-                for r in contrib.change_rows:
-                    if (
-                        r.change_type == "row_delete"
-                        and r.key_tuple == key_str
-                        and r.column_name in values
-                    ):
-                        values[r.column_name] = r.old_value
-                review_row = _ReviewRow(
-                    key_str=key_str, status="DELETE", values=values
-                )
+                values = {c: col_vals.get(c, "") for c in columns}
+                review_row = _ReviewRow(key_str=key_str, status="DELETE", values=values)
                 row_map[key_str] = review_row
             else:
                 review_row.status = "DELETE"
-                for r in contrib.change_rows:
-                    if (
-                        r.change_type == "row_delete"
-                        and r.key_tuple == key_str
-                        and r.column_name in review_row.values
-                    ):
-                        review_row.values[r.column_name] = r.old_value
+                for c, v in col_vals.items():
+                    if c in review_row.values:
+                        review_row.values[c] = v
             _record_source_cr(review_row, cr)
 
-        for row in contrib.change_rows:
-            if row.change_type != "value_update":
+        for key_str, col, old_v, new_v in updates:
+            if col not in col_set:
                 continue
-            if not row.key_tuple or not row.column_name:
-                continue
-            if row.column_name not in columns:
-                continue
-            review_row = row_map.get(row.key_tuple)
+            review_row = row_map.get(key_str)
             if review_row is None:
                 review_row = _ReviewRow(
-                    key_str=row.key_tuple,
+                    key_str=key_str,
                     status="",
                     values={c: "" for c in columns},
                 )
-                row_map[row.key_tuple] = review_row
+                row_map[key_str] = review_row
             _record_source_cr(review_row, cr)
-            review_row.cell_updates.setdefault(row.column_name, []).append(
+            review_row.cell_updates.setdefault(col, []).append(
                 _CellAnnotation(
-                    old_value=row.old_value,
-                    new_value=row.new_value,
+                    old_value=old_v,
+                    new_value=new_v,
                     change_request_id=cr,
                 )
             )
-            # Keep display new value as base when not overwritten by annotation format
-            review_row.values[row.column_name] = row.new_value
+            review_row.values[col] = new_v
 
 
 def _display_cell(review_row: _ReviewRow, column: str, multi_cr: bool) -> str:
@@ -415,59 +529,53 @@ def _unique_sheet_name(table_name: str, used: set[str]) -> str:
     raise ValueError(f"Unable to allocate unique sheet name for table {table_name!r}")
 
 
-def _write_review_sheet(ws: Worksheet, grid: ReviewGrid) -> None:
-    bold = Font(bold=True)
-    row_idx = 1
+def _write_review_sheet(ws: Any, grid: ReviewGrid, formats: _ReviewFormats) -> None:
+    row_idx = 0
 
-    # Title / legend
-    ws.cell(
+    ws.write(
         row_idx,
-        1,
+        0,
         f"Review: {grid.table_name} (human review only - not used by apply)",
+        formats.bold,
     )
-    ws.cell(row_idx, 1).font = bold
     row_idx += 1
 
     if grid.structural_notes:
-        ws.cell(row_idx, 1, "Structural changes:")
-        ws.cell(row_idx, 1).font = bold
+        ws.write(row_idx, 0, "Structural changes:", formats.bold)
         row_idx += 1
         for note in grid.structural_notes:
-            cell = ws.cell(row_idx, 1, note)
-            cell.fill = _FILL_NOTE
+            ws.write(row_idx, 0, note, formats.note)
             row_idx += 1
 
     # Blank spacer when we had notes or title
     row_idx += 1
 
-    headers = [_CHANGE_COL, *grid.columns]
-    for j, h in enumerate(headers, start=1):
-        cell = ws.cell(row_idx, j, h)
-        cell.font = bold
-        cell.fill = _FILL_HEADER
     header_row = row_idx
-    row_idx += 1
+    # Freeze below the header and after the _change column (set before data for
+    # xlsxwriter constant_memory).
+    ws.freeze_panes(header_row + 1, 1)
+
+    headers = [_CHANGE_COL, *grid.columns]
+    for j, header in enumerate(headers):
+        ws.write(header_row, j, header, formats.header)
+    row_idx = header_row + 1
 
     for review_row in grid.rows:
         status = review_row.status
-        status_cell = ws.cell(row_idx, 1, _format_change_cell(review_row))
         if status == "ADD":
-            status_cell.fill = _FILL_ADD
+            row_fmt = formats.add
         elif status == "DELETE":
-            status_cell.fill = _FILL_DELETE
+            row_fmt = formats.delete
+        else:
+            row_fmt = None
 
-        for j, col in enumerate(grid.columns, start=2):
-            has_update = col in review_row.cell_updates
+        ws.write(row_idx, 0, _format_change_cell(review_row), row_fmt)
+
+        for j, col in enumerate(grid.columns, start=1):
             value = _display_cell(review_row, col, grid.multi_cr)
-            cell = ws.cell(row_idx, j, value)
-            if status == "ADD":
-                cell.fill = _FILL_ADD
-            elif status == "DELETE":
-                cell.fill = _FILL_DELETE
-            elif has_update:
-                cell.fill = _FILL_UPDATE
+            cell_fmt = row_fmt
+            if cell_fmt is None and col in review_row.cell_updates:
+                cell_fmt = formats.update
+            ws.write(row_idx, j, value, cell_fmt)
 
         row_idx += 1
-
-    # Light freeze: freeze below header
-    ws.freeze_panes = ws.cell(header_row + 1, 2)

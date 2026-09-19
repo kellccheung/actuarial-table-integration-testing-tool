@@ -1,2 +1,2 @@
 change_request_id,table_name,change_type,n_keys_before,n_keys_after,key_tuple,column_name,old_value,new_value,notes
-CR_T06_Rename,MORT_TABLE,column_rename,4,4,,OldRate->Rate,OldRate,Rate,Declared in ColumnRenames
+CR_T06_Rename,MORT_TABLE,column_rename,4,4,"",OldRate->Rate,OldRate,Rate,Declared in ColumnRenames

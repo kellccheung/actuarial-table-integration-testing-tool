@@ -34,8 +34,8 @@ set "CONTROL=%~1"
 if "%CONTROL%"=="" (
   set /p CONTROL=Path to Control.xlsx: 
 )
-REM strip accidental quotes from set /p
-set "CONTROL=%CONTROL:"=%"
+REM strip accidental quotes from set /p (skip when blank: empty %VAR:"=% breaks cmd parsing)
+if defined CONTROL set "CONTROL=%CONTROL:"=%"
 
 if "%CONTROL%"=="" (
   echo No Control.xlsx path provided.
@@ -52,11 +52,25 @@ if not exist "%CONTROL%" (
   exit /b 1
 )
 
+set "CHANGELOG=%~2"
+if "%CHANGELOG%"=="" (
+  echo.
+  echo Change Log is only used for validate_only / apply; leave blank for newest ^(or for Stage 1^).
+  set /p CHANGELOG=Change Log path or filename ^(blank = newest^): 
+)
+REM strip accidental quotes from set /p (skip when blank: empty %VAR:"=% breaks cmd parsing)
+if defined CHANGELOG set "CHANGELOG=%CHANGELOG:"=%"
+
 echo.
 echo Running with Control: %CONTROL%
+if not "%CHANGELOG%"=="" echo Change Log: %CHANGELOG%
 echo.
 
-call "%CONDA_EXE%" run --no-capture-output -n prophet-table python "%~dp0run_launcher.py" "%CONTROL%"
+if "%CHANGELOG%"=="" (
+  call "%CONDA_EXE%" run --no-capture-output -n prophet-table python -m prophet_table_tool "%CONTROL%"
+) else (
+  call "%CONDA_EXE%" run --no-capture-output -n prophet-table python -m prophet_table_tool "%CONTROL%" --change-log "%CHANGELOG%"
+)
 set "RC=%ERRORLEVEL%"
 
 echo.

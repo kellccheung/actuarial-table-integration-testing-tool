@@ -43,8 +43,8 @@ def test_read_fac_strips_dummy_lines(tmp_path: Path):
     assert table.n_keys == 4
     assert table.columns == ["Age", "Duration", "Product", "Rate", "Loading"]
     assert table.data.height == 3
-    assert table.leading_dummy_lines == ["Prophet table,,,,,"]
-    assert table.trailing_dummy_lines == ["Edited on 2026,,,,,"]
+    assert table.leading_dummy_lines == [b'Prophet table,,,,,']
+    assert table.trailing_dummy_lines == [b'Edited on 2026,,,,,']
     assert table.data["Age"].to_list() == ["20", "25", "30"]
 
 
@@ -65,6 +65,27 @@ def test_write_preserves_production_dummies(tmp_path: Path):
     assert text.startswith("Prophet table,,,,,\n!4,")
     assert "*,20,1,PROD_A,0.0099,1.05\n" in text
     assert text.rstrip("\n").endswith("Edited on 2026,,,,,")
+
+
+def test_trailing_dummy_non_utf8_roundtrip(tmp_path: Path):
+    """Trailer bytes are copied as-is and never parsed as CSV."""
+    raw = (
+        b"!2,Age,Rate\n"
+        b"*,20,0.1\n"
+        b"\xff\xfe edited \xa3"
+    )
+    path = tmp_path / "ODD.FAC"
+    path.write_bytes(raw + b"\n")
+    table = read_prophet_csv(path)
+    assert table.data.height == 1
+    assert table.data["Age"].to_list() == ["20"]
+    assert table.trailing_dummy_lines == [b"\xff\xfe edited \xa3"]
+
+    out = tmp_path / "out.FAC"
+    write_prophet_csv(table, out)
+    written = out.read_bytes()
+    assert written.endswith(b"\xff\xfe edited \xa3\n")
+    assert b"*,20,0.1\n" in written
 
 
 def test_diff_ignores_differing_dummy_lines(tmp_path: Path):

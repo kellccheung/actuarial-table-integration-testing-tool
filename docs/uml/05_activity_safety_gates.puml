@@ -6,45 +6,65 @@ skinparam ActivityBorderColor Black
 
 start
 
-:Load Control.xlsx + ChangeLog_*.xlsx;
-:Filter include=Y AND approved=Y;\nsort by order;
+:Load Control.xlsx +\nChangeLog_*_Detail.csv +\nConflicts sheet;
+:Filter include=Y AND approved=Y;\nsort by Control.order;
 
-if (Unresolved conflicts?) then (yes + apply)
+if (Unresolved conflicts\ninvolving an approved CR?) then (yes + apply)
   :Hard stop;\nwrite Validation_Report FAIL;
   stop
 else (no / or validate_only continues)
 endif
 
-:Load Production_Tables into memory;
+:Load **touched** Production_Tables\n(recursive *.csv / *.FAC);
 
-if (All referenced tables exist\n(except pure table_add)?) then (no)
-  :Hard stop;\nwrite Validation_Report FAIL;
-  stop
-else (yes)
-endif
-
-if (value_update / row_delete:\nkey + old_value exact match?) then (no)
-  :Hard stop;\nmismatched key/value message;
-  stop
-else (yes)
-endif
-
-if (key_count_change present?) then (yes)
-  if (Approved in Control\n/ KeyCountApprovals?) then (no)
-    :Hard stop;\nkey-count blocked;
-    stop
+partition "Per approved CR in Control.order" {
+  if (All referenced tables exist\n(except pure table_add)?) then (no)
+    :Mark this CR failed;
   else (yes)
-  endif
-else (n/a)
-endif
 
-if (column_rename present?) then (yes)
-  if (Declared in ColumnRenames?) then (no)
-    :Hard stop;\nrename not declared;
-    stop
-  else (yes)
+    if (value_update / row_delete:\nkey exists in **current** table?) then (no)
+      :Mark this CR failed;\nkey not found;
+    else (yes)
+    endif
+
+    if (row_add: key already exists\nin **current** table?) then (yes)
+      :Mark this CR failed;\nduplicate key;
+    else (no)
+    endif
+
+    if (key_count_change present?) then (yes)
+      if (KeyCountApprovals row if present,\nelse CR.approved?) then (no)
+        :Mark this CR failed;\nkey-count blocked;
+      else (yes)
+      endif
+    else (n/a)
+    endif
+
+    if (column_rename present?) then (yes)
+      if (Declared in ColumnRenames?) then (no)
+        :Mark this CR failed;\nrename not declared;
+      else (yes)
+      endif
+    else (n/a)
+    endif
   endif
-else (n/a)
+
+  if (this CR ok?) then (yes)
+    :Apply CR in memory so the next CR\nvalidates against the updated table;
+  else (no)
+    :Skip in-memory apply for this CR;
+  endif
+}
+
+note right
+  Change Log old_value is informational.
+  It is **not** required to match production.
+end note
+
+if (any CR failed?) then (yes)
+  :Write Validation_Report FAIL;\nnever write tables;
+  stop
+else (no)
 endif
 
 if (mode?) then (validate_only)
@@ -52,8 +72,8 @@ if (mode?) then (validate_only)
   :Write **zero** files to\nNew_Production_Tables/;
   stop
 else (apply)
-  :Apply changes sequentially\nin Control.order;
-  :Write New_Production_Tables/\noriginal filenames, !N/* format;
+  :Write changed tables to\nNew_Production_Tables/\noriginal relative paths, !N/* +\ndummy lines preserved;
+  :Copy unchanged production tables\ninto the same output folder;
   :Write IntegrationReport\nstatus = SUCCESS;
   stop
 endif

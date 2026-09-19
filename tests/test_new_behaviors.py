@@ -9,8 +9,11 @@ from openpyxl import Workbook, load_workbook
 
 from prophet_table_tool.changelog import generate_change_log
 from prophet_table_tool.changelog_review import (
+    TableReviewModel,
     add_contribution,
     build_review_grid,
+    group_table_reviews,
+    review_group_for_table,
     write_review_sheets,
 )
 from prophet_table_tool.control import ControlConfig
@@ -219,11 +222,20 @@ def test_subfolder_tables_compared_separately(tmp_path: Path):
     lines = [ln for ln in text.splitlines() if "SubB/T" in ln and "value_update" in ln]
     assert lines == []
 
-    # Review sheets get unique sanitized names
+    # Canonical Change Log is an index (no per-table review tabs)
     wb2 = load_workbook(clog)
     assert "ChangeLog_Detail" not in wb2.sheetnames
-    assert any("SubA" in n for n in wb2.sheetnames)
+    assert "ReviewFiles" in wb2.sheetnames
+    assert not any("SubA" in n for n in wb2.sheetnames)
+    review_index = list(wb2["ReviewFiles"].iter_rows(values_only=True))
     wb2.close()
+    assert any(row and row[0] == "SubA/T" for row in review_index[1:])
+
+    review_a = clog.parent / f"{clog.stem}_reviews" / "SubA.xlsx"
+    assert review_a.is_file()
+    wb_a = load_workbook(review_a)
+    assert any("SubA" in n for n in wb_a.sheetnames)
+    wb_a.close()
 
 
 def _cr(
@@ -309,6 +321,147 @@ def test_missing_row_column_fill_same_cr_no_false_positive():
     assert not any(c["conflict_type"] == "missing_row_column_fill" for c in conflicts)
 
 
+def test_cell_overlap_same_new_value_still_flagged():
+    """Identical destination values are still cell_overlap; notes say they agree."""
+    rows = [
+        _cr(
+            "CR_A",
+            "value_update",
+            key_tuple="20|1|PROD_A",
+            column_name="Rate",
+            old_value="0.0012",
+            new_value="0.0018",
+        ),
+        _cr(
+            "CR_B",
+            "value_update",
+            key_tuple="20|1|PROD_A",
+            column_name="Rate",
+            old_value="0.0012",
+            new_value="0.0018",
+        ),
+    ]
+    conflicts = detect_conflicts(rows)
+    overlap = [c for c in conflicts if c["conflict_type"] == "cell_overlap"]
+    assert len(overlap) == 1
+    assert overlap[0]["resolved"] == "N"
+    assert overlap[0]["change_request_ids"] == ["CR_A", "CR_B"]
+    assert overlap[0]["new_values"] == ["0.0018"]
+    assert "same new_value" in overlap[0]["notes"]
+    assert "resolved=Y" in overlap[0]["notes"]
+
+
+def test_cell_overlap_numeric_equal_new_values_still_flagged():
+    """1.10 vs 1.1 is still cell_overlap with same-value notes."""
+    rows = [
+        _cr(
+            "CR_A",
+            "value_update",
+            key_tuple="20|1|PROD_A",
+            column_name="Rate",
+            new_value="1.10",
+        ),
+        _cr(
+            "CR_B",
+            "value_update",
+            key_tuple="20|1|PROD_A",
+            column_name="Rate",
+            new_value="1.1",
+        ),
+    ]
+    conflicts = detect_conflicts(rows)
+    overlap = [c for c in conflicts if c["conflict_type"] == "cell_overlap"]
+    assert len(overlap) == 1
+    assert overlap[0]["resolved"] == "N"
+    assert sorted(overlap[0]["new_values"]) == ["1.1", "1.10"]
+    assert "same new_value" in overlap[0]["notes"]
+
+
+def test_cell_overlap_different_new_values_notes():
+    """Disagreeing new_values stay cell_overlap without the same-value notes."""
+    rows = [
+        _cr(
+            "CR_A",
+            "value_update",
+            key_tuple="20|1|PROD_A",
+            column_name="Rate",
+            new_value="0.0018",
+        ),
+        _cr(
+            "CR_B",
+            "value_update",
+            key_tuple="20|1|PROD_A",
+            column_name="Rate",
+            new_value="0.0019",
+        ),
+    ]
+    conflicts = detect_conflicts(rows)
+    overlap = [c for c in conflicts if c["conflict_type"] == "cell_overlap"]
+    assert len(overlap) == 1
+    assert overlap[0]["resolved"] == "N"
+    assert "Control order" in overlap[0]["notes"]
+    assert "later CR wins" in overlap[0]["notes"]
+    assert "same new_value" not in overlap[0]["notes"]
+
+
+def test_cell_overlap_row_add_then_value_update_notes():
+    """Follow-on value_update on a row_add cell is still overlap; notes mention sequence."""
+    rows = [
+        _cr(
+            "CR_A",
+            "row_add",
+            key_tuple="99|1|PROD_A",
+            column_name="Rate",
+            new_value="0.5",
+        ),
+        _cr(
+            "CR_B",
+            "value_update",
+            key_tuple="99|1|PROD_A",
+            column_name="Rate",
+            old_value="0.5",
+            new_value="0.8",
+        ),
+    ]
+    conflicts = detect_conflicts(rows)
+    overlap = [c for c in conflicts if c["conflict_type"] == "cell_overlap"]
+    assert len(overlap) == 1
+    assert overlap[0]["resolved"] == "N"
+    assert "row_add and value_update" in overlap[0]["notes"]
+    assert "Control order" in overlap[0]["notes"]
+    assert "same new_value" not in overlap[0]["notes"]
+
+
+def test_cell_overlap_column_add_then_value_update_notes():
+    """Follow-on value_update on a newly added column is still overlap; notes mention sequence."""
+    rows = [
+        _cr("CR_A", "column_add", column_name="NewCol"),
+        _cr(
+            "CR_A",
+            "value_update",
+            key_tuple="20|1|PROD_A",
+            column_name="NewCol",
+            new_value="x",
+            notes="Value on newly added column",
+        ),
+        _cr(
+            "CR_B",
+            "value_update",
+            key_tuple="20|1|PROD_A",
+            column_name="NewCol",
+            old_value="x",
+            new_value="y",
+        ),
+    ]
+    conflicts = detect_conflicts(rows)
+    overlap = [c for c in conflicts if c["conflict_type"] == "cell_overlap"]
+    assert len(overlap) == 1
+    assert overlap[0]["resolved"] == "N"
+    assert "column_add and value_update" in overlap[0]["notes"]
+    assert "Control order" in overlap[0]["notes"]
+    assert "same new_value" not in overlap[0]["notes"]
+
+
 def _prophet_table(columns: list[str], rows: list[dict[str, str]], n_keys: int = 2) -> ProphetTable:
     data = {c: [r[c] for r in rows] for c in columns}
     return ProphetTable(
@@ -330,7 +483,24 @@ def _change_cells_by_first_data_col(ws) -> dict[str, str]:
     return out
 
 
-def test_review_change_column_includes_cr_ids():
+def test_review_group_for_table_uses_first_path_segment():
+    assert review_group_for_table("MORT_TABLE") == "root"
+    assert review_group_for_table("BE/MORT_TABLE") == "BE"
+    assert review_group_for_table("BE/sub/X") == "BE"
+    assert review_group_for_table("IFRS/FOO") == "IFRS"
+    grouped = group_table_reviews(
+        {
+            "MORT_TABLE": TableReviewModel(table_name="MORT_TABLE"),
+            "BE/MORT_TABLE": TableReviewModel(table_name="BE/MORT_TABLE"),
+            "IFRS/FOO": TableReviewModel(table_name="IFRS/FOO"),
+        }
+    )
+    assert set(grouped) == {"root", "BE", "IFRS"}
+    assert set(grouped["root"]) == {"MORT_TABLE"}
+    assert set(grouped["BE"]) == {"BE/MORT_TABLE"}
+
+
+def test_review_change_column_includes_cr_ids(tmp_path: Path):
     """_change names the CR for value_update, ADD, and DELETE rows."""
     columns = ["Age", "Rate"]
     before = _prophet_table(
@@ -383,15 +553,17 @@ def test_review_change_column_includes_cr_ids():
     assert by_key["40"].status == "ADD"
     assert by_key["40"].source_crs == ["CR_X"]
 
-    wb = Workbook()
-    write_review_sheets(wb, reviews)
+    out = tmp_path / "review.xlsx"
+    write_review_sheets(out, reviews)
+    wb = load_workbook(out)
     change_cells = _change_cells_by_first_data_col(wb["T"])
+    wb.close()
     assert change_cells["20"] == "[CR_X]"
     assert change_cells["40"] == "ADD [CR_X]"
     assert change_cells["30"] == "DELETE [CR_X]"
 
 
-def test_review_change_column_joins_multiple_crs():
+def test_review_change_column_joins_multiple_crs(tmp_path: Path):
     """Same key touched by two CRs lists both ids in contribution order."""
     columns = ["Age", "Rate", "Loading"]
     before = _prophet_table(
@@ -440,7 +612,9 @@ def test_review_change_column_joins_multiple_crs():
             )
         ],
     )
-    wb = Workbook()
-    write_review_sheets(wb, reviews)
+    out = tmp_path / "review.xlsx"
+    write_review_sheets(out, reviews)
+    wb = load_workbook(out)
     change_cells = _change_cells_by_first_data_col(wb["T"])
+    wb.close()
     assert change_cells["20"] == "[CR_A] | [CR_B]"

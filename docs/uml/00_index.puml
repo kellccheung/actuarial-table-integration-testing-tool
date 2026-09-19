@@ -15,6 +15,12 @@ note as N1
     Stage 2 integrate_changes
   05_activity_safety_gates.puml
     Stage 2 validation / safety gates
+  06_activity_stage1_changelog.puml
+    Stage 1 generate Change Log + conflict detection
+  07_activity_stage1_diff_table.puml
+    Stage 1 per-table diff_table
+  08_activity_stage1_swimlane.puml
+    Stage 1 generate Change Log (swimlanes)
   ----
   Render with PlantUML CLI or an IDE plugin, e.g.:
     java -jar plantuml.jar docs/uml/*.puml

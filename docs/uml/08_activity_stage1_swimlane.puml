@@ -1,0 +1,92 @@
+@startuml prophet_table_tool_stage1_swimlane
+title Stage 1 -- Generate Change Log (swimlanes)
+skinparam shadowing false
+skinparam ActivityBackgroundColor White
+skinparam ActivityBorderColor Black
+skinparam ActivityDiamondBackgroundColor White
+
+|generate_change_log|
+start
+:Read Control.xlsx;
+:Ensure output_path exists;
+:Open audit logger\n(mode = generate_changelog);
+:included_requests(require_approved=False)\ninclude=Y, sorted by order;
+
+while (more included CRs?) is (yes)
+  |prophet_csv|
+  :Discover CSV/FAC tables recursively\nin CR/before and CR/after\n(identity = relative path without suffix);
+
+  |generate_change_log|
+  if (no CSVs in before/ or after/?) then (yes)
+    :Warn, Summary status = EMPTY;
+  else (no)
+    :Warn + skip tables only in before/\n(no automatic table deletes);
+
+    while (more tables in after or both?) is (yes)
+      |prophet_csv|
+      :Read Prophet CSVs;
+
+      |diff_table|
+      :Compute structural_rows +\ncell_changes for this table;
+      note right
+        table_add, key_count_change,
+        column_rename / add / delete,
+        row_add, row_delete, value_update
+        (see 07_activity_stage1_diff_table.puml)
+      end note
+
+      |changelog_review|
+      :add_contribution\n(sparse before/after + changes);
+
+      |generate_change_log|
+      :Accumulate structural + cell rows;
+    endwhile (no)
+
+    :Append CR Summary\n(counts by change_type,\nstatus = OK or NO_CHANGES);
+  endif
+endwhile (no)
+
+|detect_conflicts|
+:Build column_add index\n(table, column) -> CR ids;
+:Index cell edits\nvalue_update / row_add / row_delete\nby (table, key_tuple, column);
+
+if (2 or more CRs touch the same cell?) then (yes)
+  :Emit cell_overlap\n(resolved = N);
+  note right
+    notes distinguish:
+    - same new_value (numeric-aware)
+    - sequenced row_add / column_add + value_update
+    - independent updates (later CR wins if resolved)
+  end note
+else (no)
+endif
+
+:Index structural rows\nkey_count_change, column_add/delete/rename, table_add\nby table;
+
+if (2 or more CRs apply structural changes\nto the same table?) then (yes)
+  :Emit structural_collision\n(resolved = N);
+else (no)
+endif
+
+:Find row_add x column_add cells\nwith no covering row_add / value_update;
+
+if (uncovered intersection cell?) then (yes)
+  :Emit missing_row_column_fill\n(resolved = N);
+else (no)
+endif
+
+|generate_change_log|
+:Mark Summary has_conflict = Y\nand status = CONFLICT for involved CRs;
+
+|Outputs|
+:Write ChangeLog_*_Detail.csv;
+|changelog_review|
+:Write ChangeLog_*_reviews/group.xlsx\n(Conflicts filtered to that folder);
+|Outputs|
+:Write ChangeLog_*.xlsx\n(Summary / Conflicts / ReviewFiles);
+
+|generate_change_log|
+:Log SUCCESS, close audit logger;
+stop
+
+@enduml

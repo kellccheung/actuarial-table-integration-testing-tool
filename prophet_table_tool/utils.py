@@ -38,11 +38,6 @@ def yn_to_bool(value: object) -> bool:
     return str(value).strip().upper() in {"Y", "YES", "TRUE", "1"}
 
 
-def table_stem(filename: str | Path) -> str:
-    """Return the table name (filename without .csv extension)."""
-    return Path(filename).stem
-
-
 def normalize_key_part(value: object) -> str:
     """
     Canonicalize one key cell for matching.

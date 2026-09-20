@@ -15,9 +15,9 @@ if (Unresolved conflicts\ninvolving an approved CR?) then (yes + apply)
 else (no / or validate_only continues)
 endif
 
-:Load **touched** Production_Tables\n(recursive *.csv / *.FAC);
+:Discover production **paths**\n(recursive *.csv / *.FAC);\nload one touched table at a time;
 
-partition "Per approved CR in Control.order" {
+partition "Per touched table, then CR in Control.order" {
   if (All referenced tables exist\n(except pure table_add)?) then (no)
     :Mark this CR failed;
   else (yes)
@@ -49,10 +49,10 @@ partition "Per approved CR in Control.order" {
     endif
   endif
 
-  if (this CR ok?) then (yes)
-    :Apply CR in memory so the next CR\nvalidates against the updated table;
+  if (this CR+table ok?) then (yes)
+    :Apply CR in memory so the next CR\non this table validates against\nthe updated table;
   else (no)
-    :Skip in-memory apply for this CR;
+    :Skip in-memory apply for this CR+table;
   endif
 }
 
@@ -61,8 +61,8 @@ note right
   It is **not** required to match production.
 end note
 
-if (any CR failed?) then (yes)
-  :Write Validation_Report FAIL;\nnever write tables;
+if (any CR+table failed?) then (yes)
+  :Write Validation_Report FAIL;\ndelete staging; never write tables;
   stop
 else (no)
 endif
@@ -72,8 +72,9 @@ if (mode?) then (validate_only)
   :Write **zero** files to\nNew_Production_Tables/;
   stop
 else (apply)
-  :Write changed tables to\nNew_Production_Tables/\noriginal relative paths, !N/* +\ndummy lines preserved;
+  :Publish staging .stage2_<run_id>\nto New_Production_Tables/\noriginal relative paths, !N/* +\ndummy lines preserved;
   :Copy unchanged production tables\ninto the same output folder;
+  :Delete staging folder;
   :Write IntegrationReport\nstatus = SUCCESS;
   stop
 endif

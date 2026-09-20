@@ -80,6 +80,17 @@ def _mark_conflicts_resolved(clog: Path) -> None:
     wb.close()
 
 
+def _stage2_leftovers(root: Path) -> list[Path]:
+    out = root / "Output"
+    if not out.is_dir():
+        return []
+    return sorted(p for p in out.glob(".stage2_*") if p.is_dir())
+
+
+def _write_named(root: Path, table_name: str, rows: list[list[str]]) -> None:
+    _write_csv(root / f"{table_name}.csv", rows)
+
+
 def _report_messages(report: Path) -> list[dict]:
     wb = load_workbook(report, data_only=True)
     ws = wb["Validation_Report"]
@@ -153,6 +164,7 @@ def test_row_add_then_value_update_validate_only_no_files(tmp_path: Path):
     wb.close()
     new_dir = tmp_path / "Output" / "New_Production_Tables"
     assert not new_dir.exists() or list(new_dir.glob("*.csv")) == []
+    assert _stage2_leftovers(tmp_path) == []
 
 
 def test_row_add_then_value_update_unresolved_apply_fails(tmp_path: Path):
@@ -164,6 +176,7 @@ def test_row_add_then_value_update_unresolved_apply_fails(tmp_path: Path):
     wb.close()
     new_dir = tmp_path / "Output" / "New_Production_Tables"
     assert not new_dir.exists() or list(new_dir.glob("*.csv")) == []
+    assert _stage2_leftovers(tmp_path) == []
 
 
 def test_duplicate_row_add_fails_key_already_exists(tmp_path: Path):
@@ -327,3 +340,107 @@ def test_differing_value_update_resolved_later_cr_wins(tmp_path: Path):
     )
     assert "*,20,1,PROD_A,0.0019,1.05" in text
     assert "0.0018" not in text
+    assert _stage2_leftovers(tmp_path) == []
+
+
+def _setup_two_tables_add_then_edit(tmp_path: Path) -> Path:
+    """CR_A adds a row to two tables; CR_B edits that row on both."""
+    b1, a1 = _cr_dirs(tmp_path, "CR_A")
+    b2, a2 = _cr_dirs(tmp_path, "CR_B")
+    prod_plus = PROD + [NEW_ROW]
+    prod_plus_edit = PROD + [NEW_ROW_EDITED]
+    prod_dir = tmp_path / "Production_Tables"
+    for table_name in ("EXPENSE_TABLE", "MORT_TABLE"):
+        _write_named(prod_dir, table_name, PROD)
+        _write_named(b1, table_name, PROD)
+        _write_named(a1, table_name, prod_plus)
+        _write_named(b2, table_name, prod_plus)
+        _write_named(a2, table_name, prod_plus_edit)
+    return _write_control(
+        tmp_path,
+        [
+            ("CR_A", 1, "Y", "Y", "Add row both tables", ""),
+            ("CR_B", 2, "Y", "Y", "Edit new row both tables", ""),
+        ],
+        "SEQ_TWO_TABLES",
+    )
+
+
+def test_two_tables_two_crs_apply_respects_order(tmp_path: Path):
+    control = _setup_two_tables_add_then_edit(tmp_path)
+    clog = generate_change_log(control)
+    _mark_conflicts_resolved(clog)
+    report = integrate_changes(control, clog, "apply")
+    wb = load_workbook(report, data_only=True)
+    assert wb["Summary"]["B1"].value == "SUCCESS"
+    wb.close()
+    out = tmp_path / "Output" / "New_Production_Tables"
+    for table_name in ("EXPENSE_TABLE", "MORT_TABLE"):
+        text = (out / f"{table_name}.csv").read_text(encoding="utf-8")
+        assert f"*,99,1,PROD_A,0.8,1.05" in text
+        assert text.count("*,99,1,PROD_A,") == 1
+    assert _stage2_leftovers(tmp_path) == []
+
+
+def test_two_tables_validate_only_no_staging_leftovers(tmp_path: Path):
+    control = _setup_two_tables_add_then_edit(tmp_path)
+    clog = generate_change_log(control)
+    _mark_conflicts_resolved(clog)
+    report = integrate_changes(control, clog, "validate_only")
+    wb = load_workbook(report, data_only=True)
+    assert wb["Summary"]["B1"].value == "DRY_RUN_SUCCESS"
+    wb.close()
+    new_dir = tmp_path / "Output" / "New_Production_Tables"
+    assert not new_dir.exists() or list(new_dir.glob("*.csv")) == []
+    assert _stage2_leftovers(tmp_path) == []
+
+
+def test_mixed_cr_failure_per_table_apply_then_overall_fail(tmp_path: Path):
+    """CR_A valid on MORT, invalid on EXPENSE; CR_B can still see CR_A on MORT.
+
+    Overall run fails and writes no New_Production_Tables / staging leftovers.
+    """
+    b1, a1 = _cr_dirs(tmp_path, "CR_A")
+    b2, a2 = _cr_dirs(tmp_path, "CR_B")
+    prod_plus = PROD + [NEW_ROW]
+    prod_plus_edit = PROD + [NEW_ROW_EDITED]
+    prod_dir = tmp_path / "Production_Tables"
+    _write_named(prod_dir, "MORT_TABLE", PROD)
+    _write_named(prod_dir, "EXPENSE_TABLE", PROD)
+    _write_named(b1, "MORT_TABLE", PROD)
+    _write_named(a1, "MORT_TABLE", prod_plus)
+    _write_named(b1, "EXPENSE_TABLE", prod_plus)
+    _write_named(a1, "EXPENSE_TABLE", prod_plus_edit)
+    _write_named(b2, "MORT_TABLE", prod_plus)
+    _write_named(a2, "MORT_TABLE", prod_plus_edit)
+    control = _write_control(
+        tmp_path,
+        [
+            ("CR_A", 1, "Y", "Y", "Add MORT / edit missing EXPENSE key", ""),
+            ("CR_B", 2, "Y", "Y", "Edit MORT row added by CR_A", ""),
+        ],
+        "SEQ_MIXED_FAIL",
+    )
+    clog = generate_change_log(control)
+    _mark_conflicts_resolved(clog)
+    report = integrate_changes(control, clog, "apply")
+    wb = load_workbook(report, data_only=True)
+    assert wb["Summary"]["B1"].value == "FAILED"
+    wb.close()
+    msgs = _report_messages(report)
+    assert any(
+        m.get("change_request_id") == "CR_A"
+        and m.get("table_name") == "EXPENSE_TABLE"
+        and "Key not found" in str(m.get("message") or "")
+        for m in msgs
+    )
+    assert any(
+        m.get("change_request_id") == "CR_B"
+        and m.get("table_name") == "MORT_TABLE"
+        and m.get("severity") == "INFO"
+        and "Validation passed" in str(m.get("message") or "")
+        for m in msgs
+    )
+    new_dir = tmp_path / "Output" / "New_Production_Tables"
+    assert not new_dir.exists() or list(new_dir.glob("*.csv")) == []
+    assert _stage2_leftovers(tmp_path) == []

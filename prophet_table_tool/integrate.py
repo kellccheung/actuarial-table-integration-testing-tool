@@ -47,6 +47,10 @@ def integrate_changes(
     """
     Stage 2: Validate (and optionally apply) a Change Log onto production tables.
 
+    Touched tables are loaded one at a time. CRs run in Control ``order`` against
+    that table; ``apply`` spills each finished table to a staging folder and
+    publishes to ``New_Production_Tables/`` only if every table passed.
+
     Returns the path to IntegrationReport_*.xlsx.
     """
     if mode not in {"validate_only", "apply"}:
@@ -62,6 +66,7 @@ def integrate_changes(
     status = "FAILED"
     report_path = control.output_path / f"IntegrationReport_{run_id}.xlsx"
     validation_messages: list[dict] = []
+    staging_dir = control.output_path / f".stage2_{run_id}"
 
     try:
         logger.info("control_path=%s", control_path)
@@ -111,28 +116,40 @@ def integrate_changes(
                 logger.info("final_status=%s", status)
                 return report_path
 
-        logger.info("loading production tables from %s", control.production_tables_path)
+        logger.info("discovering production tables in %s", control.production_tables_path)
         prod_paths = discover_csv_tables(control.production_tables_path)
         touched = {r.table_name for r in detail_rows}
-        logger.info("discovered %d production table(s); loading %d touched", len(prod_paths), len(touched))
-        tables: dict[str, ProphetTable] = {}
-        for name in sorted(touched):
-            path = prod_paths.get(name)
-            if path is None:
-                continue
-            logger.info("reading production table %s", name)
-            tables[name] = read_prophet_csv(path)
+        logger.info(
+            "discovered %d production table(s); processing %d touched one at a time",
+            len(prod_paths),
+            len(touched),
+        )
 
-        by_cr_table: dict[str, dict[str, list[ChangeRow]]] = defaultdict(lambda: defaultdict(list))
+        by_table_cr: dict[str, dict[str, list[ChangeRow]]] = defaultdict(lambda: defaultdict(list))
         for row in detail_rows:
-            by_cr_table[row.change_request_id][row.table_name].append(row)
+            by_table_cr[row.table_name][row.change_request_id].append(row)
 
         ok = True
         staged: list[tuple[str, str, int]] = []
-        for cr in approved_crs:
-            table_items = list(by_cr_table.get(cr.change_request_id, {}).items())
-            cr_ok = True
-            for table_name, rows in table_items:
+        staged_names: set[str] = set()
+        n_touched = len(touched)
+        for i, table_name in enumerate(sorted(touched), start=1):
+            logger.info(
+                "loading production table %s (%d/%d)",
+                table_name,
+                i,
+                n_touched,
+            )
+            tables: dict[str, ProphetTable] = {}
+            path = prod_paths.get(table_name)
+            if path is not None:
+                tables[table_name] = read_prophet_csv(path)
+
+            cr_rows = by_table_cr.get(table_name, {})
+            for cr in approved_crs:
+                rows = cr_rows.get(cr.change_request_id)
+                if not rows:
+                    continue
                 logger.info(
                     "[%s] validating %s (%d change row(s))...",
                     cr.change_request_id,
@@ -144,28 +161,34 @@ def integrate_changes(
                 )
                 validation_messages.extend(msgs)
                 if not table_ok:
-                    cr_ok = False
                     ok = False
-                    logger.warning("[%s] validation FAILED for %s", cr.change_request_id, table_name)
-                else:
-                    logger.info("[%s] validation OK for %s", cr.change_request_id, table_name)
-            if cr_ok:
-                for table_name, rows in table_items:
-                    tables[table_name] = _apply_table_changes(
-                        control, cr.change_request_id, table_name, rows, tables
-                    )
-                    staged.append((cr.change_request_id, table_name, len(rows)))
-                    logger.info(
-                        "[%s] staged %s in-memory (%d change row(s))",
+                    logger.warning(
+                        "[%s] validation FAILED for %s; skipped in-memory apply",
                         cr.change_request_id,
                         table_name,
-                        len(rows),
                     )
-            else:
-                logger.warning(
-                    "[%s] skipped in-memory apply after validation failure",
-                    cr.change_request_id,
+                    continue
+                logger.info("[%s] validation OK for %s", cr.change_request_id, table_name)
+                tables[table_name] = _apply_table_changes(
+                    control, cr.change_request_id, table_name, rows, tables
                 )
+                staged.append((cr.change_request_id, table_name, len(rows)))
+                logger.info(
+                    "[%s] staged %s in-memory (%d change row(s))",
+                    cr.change_request_id,
+                    table_name,
+                    len(rows),
+                )
+
+            if mode == "apply" and ok and table_name in tables:
+                staging_dir.mkdir(parents=True, exist_ok=True)
+                table = tables[table_name]
+                staged_path = staging_dir / Path(table_name).with_suffix(table.source_suffix)
+                staged_path.parent.mkdir(parents=True, exist_ok=True)
+                logger.info("writing staging %s -> %s", table_name, staged_path)
+                write_prophet_csv(table, staged_path)
+                staged_names.add(table_name)
+            del tables
 
         if not ok:
             status = "FAILED"
@@ -216,12 +239,19 @@ def integrate_changes(
 
         written = 0
         written_names: set[str] = set()
-        for name, table in tables.items():
-            out_path = out_dir / Path(name).with_suffix(table.source_suffix)
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            logger.info("writing %s -> %s", name, out_path)
-            write_prophet_csv(table, out_path)
-            written += 1
+        if staging_dir.is_dir():
+            for src in staging_dir.rglob("*"):
+                if not src.is_file():
+                    continue
+                rel = src.relative_to(staging_dir)
+                out_path = out_dir / rel
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                logger.info("publishing %s -> %s", rel.as_posix(), out_path)
+                shutil.copy2(src, out_path)
+                written += 1
+                written_names.add(rel.with_suffix("").as_posix())
+
+        for name in staged_names:
             written_names.add(name)
 
         for name, src in prod_paths.items():
@@ -255,7 +285,14 @@ def integrate_changes(
         logger.info("final_status=%s", status)
         raise
     finally:
+        _remove_stage2_dir(staging_dir)
         close_audit_logger(logger)
+
+
+def _remove_stage2_dir(path: Path) -> None:
+    """Delete a Stage 2 staging folder if it exists (apply spill / crash cleanup)."""
+    if path.is_dir():
+        shutil.rmtree(path, ignore_errors=True)
 
 
 def _vmsg(

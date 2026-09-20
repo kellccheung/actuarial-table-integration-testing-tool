@@ -188,10 +188,10 @@ python -m prophet_table_tool WorkingRoot\Control.xlsx --mode generate_changelog
 
 ### Stage 2 — Validate only (dry run)
 
-Checks that the Change Log can be applied cleanly against current production, **in Control `order`**:
+Checks that the Change Log can be applied cleanly against current production. Touched production tables are loaded **one at a time**. For each table, CRs run **in Control `order`**:
 
 - Referenced tables exist (except pure `table_add`)
-- Each CR is validated against the in-memory table **after earlier CRs** have been applied (simulated; no files written)
+- Each CR is validated against that table **after earlier CRs for the same table** have been applied in memory (simulated; no files written)
 - `value_update` / `row_delete` keys must exist in that current table (`old_value` is not required to match)
 - `row_add` keys must **not** already exist in that current table (no duplicate rows)
 - Column renames are declared; key-count changes are approved
@@ -206,11 +206,11 @@ python -m prophet_table_tool WorkingRoot\Control.xlsx --mode validate_only --cha
 
 ### Stage 2 — Apply
 
-Same validation as above. If everything passes, writes updated CSVs to:
+Same validation as above. Each finished table is spilled to a temporary `Output/.stage2_<run_id>/` folder (never more than one table in RAM). If everything passes, those files are published to:
 
 `Output/New_Production_Tables/`
 
-Filenames and `!N` / `*` format are preserved. Production input files are not overwritten in place.
+Filenames and `!N` / `*` format are preserved. Production input files are not overwritten in place. The staging folder is deleted after publish, on validation failure, and if the run crashes.
 
 ```bash
 python -m prophet_table_tool WorkingRoot\Control.xlsx --mode apply

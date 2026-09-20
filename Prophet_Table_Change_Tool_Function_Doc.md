@@ -189,23 +189,26 @@ def integrate_changes(
 ```
 
 **Logic:**
-1. Load production tables.
-2. Load Change Log and filter only `include=Y` + `approved=Y` change requests, sorted by `order`.
-3. Pre-validate:
-   - No unresolved conflicts (`apply` hard-stops; `validate_only` records FAIL rows and continues).
-   - Then, **per CR in Control `order`**, validate against the **current in-memory tables** (after earlier CRs have been applied in memory):
-     - All referenced tables exist (except pure `table_add`).
+1. Discover production table **paths** (do not load contents yet). Load Change Log and filter only `include=Y` + `approved=Y` change requests, sorted by `order`.
+2. Pre-validate unresolved conflicts (`apply` hard-stops; `validate_only` records FAIL rows and continues).
+3. **Per touched table** (one DataFrame in RAM):
+   - Read that production table (skip the read for a pure `table_add`).
+   - Then, **per CR in Control `order` that touches this table**, validate against the **current in-memory table** (after earlier CRs on this table have been applied in memory):
+     - The table exists (except pure `table_add`).
      - For every `value_update` / `row_delete`: the key must exist in the current table.
        Change Log `old_value` is informational and is **not** required to match.
      - For every `row_add`: the key must **not** already exist in the current table.
      - For `key_count_change`: only proceed if approved in Control.
      - For `column_rename`: only apply if declared in `ColumnRenames`.
-   - If a CR validates, apply it in memory so the next CR sees its rows/columns. `validate_only` uses the same sequence and still writes no CSVs.
-4. If any validation fails → stop and write detailed Validation_Report (never write tables in `validate_only` or on failure).
+   - If this CR+table validates, apply it in memory so the next CR on **this table** sees its rows/columns. A failure on another table does not roll back this table. `validate_only` uses the same sequence and still writes no CSVs.
+   - If `mode == "apply"` and no failures so far, write the finished table to `Output/.stage2_<run_id>/`, then drop the DataFrame.
+4. If any validation fails → write detailed Validation_Report, delete staging, never write `New_Production_Tables/` (also never write tables in `validate_only`).
 5. If `mode == "apply"` and validation passes:
-   - Write the in-memory tables to `Output/New_Production_Tables/` using **original filenames**.
+   - Publish staging files to `Output/New_Production_Tables/` using **original filenames**.
+   - Copy unchanged production tables into the same folder.
    - Preserve exact `!N` + `*` format.
-6. Always produce Integration Report + timestamped audit log.
+   - Delete the staging folder.
+6. Always produce Integration Report + timestamped audit log. Staging is also deleted on crash.
 
 ---
 
@@ -264,7 +267,7 @@ Every run writes a `.log` file containing:
   - Tables only in `before` → warning + skip (no changes generated)
 - [ ] Conflict detection works across multiple change requests (same table + same key + same column, structural collisions, or missing row×column fills).
 - [ ] Stage 2 respects `order` column and only processes `include = Y` + `approved = Y` rows.
-- [ ] Stage 2 validates each CR against the in-memory table after earlier CRs: `row_add` is blocked if the key already exists; `value_update` / `row_delete` require the key.
+- [ ] Stage 2 loads one touched production table at a time and validates each CR against that table after earlier CRs on the same table: `row_add` is blocked if the key already exists; `value_update` / `row_delete` require the key.
 - [ ] `validate_only` mode never writes any output tables.
 - [ ] `apply` mode writes new CSVs with **original filenames** and preserves exact `!N` / `*` format.
 - [ ] Key-count change is blocked unless approved in Control.

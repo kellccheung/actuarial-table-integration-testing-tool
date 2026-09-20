@@ -32,31 +32,38 @@ alt unresolved conflicts AND mode = apply
   INT -> RPT : Validation_Report FAIL
   INT --> CLI : report path (hard stop)
 else continue
-  INT -> CSV : discover production (recursive)\nread touched tables only
-  CSV --> INT : Dict of ProphetTable
+  INT -> CSV : discover production paths\n(recursive; no table contents yet)
 
-  loop each approved CR in Control.order
-    loop tables for this CR
+  loop each touched table (one in RAM)
+    INT -> CSV : read this production table\n(skip read for pure table_add)
+    CSV --> INT : ProphetTable
+    loop approved CRs in Control.order\nthat touch this table
       INT -> VAL : validate vs current\nin-memory table
       VAL --> INT : ok / failure messages
+      alt this CR+table failed
+        INT -> INT : skip in-memory apply\n(later CRs on this table\nsee previous state)
+      else CR+table ok
+        INT -> APP : apply change rows in memory
+        APP --> INT : updated ProphetTable
+      end
     end
-    alt this CR failed validation
-      INT -> INT : skip in-memory apply
-    else CR ok
-      INT -> APP : apply change rows in memory
-      APP --> INT : updated ProphetTable\n(later CRs see this)
+    alt mode = apply AND no failures so far
+      INT -> INT : write table to\nOutput/.stage2_<run_id>/
     end
+    INT -> INT : drop DataFrame
   end
 
-  alt any CR failed
-    INT -> RPT : FAIL\n(never write tables)
+  alt any CR+table failed
+    INT -> INT : delete staging folder
+    INT -> RPT : FAIL\n(never write New_Production_Tables)
     INT --> CLI : report path
   else mode = validate_only
     INT -> RPT : DRY_RUN_SUCCESS\n(zero table writes)
     INT --> CLI : report path
   else mode = apply
-    INT -> OUT : write changed tables\n(!N / star + dummy lines,\noriginal relative paths)
+    INT -> OUT : publish staging ->\nNew_Production_Tables/\n(!N / star + dummy lines,\noriginal relative paths)
     INT -> OUT : copy unchanged\nproduction tables
+    INT -> INT : delete staging folder
     INT -> RPT : SUCCESS
     INT --> CLI : report path
   end

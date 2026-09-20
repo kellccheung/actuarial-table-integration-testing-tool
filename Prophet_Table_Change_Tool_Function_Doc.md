@@ -154,7 +154,7 @@ def generate_change_log(control_path: Path) -> Path:
 
 **Conflicts**
 - Populated when overlaps or gaps are detected:
-  - `cell_overlap` — same table + key + column touched by ≥2 CRs, including when they write the same `new_value` (numeric-aware). Conflicts `notes` distinguish same-value overlaps, sequenced `row_add`/`column_add` + `value_update`, and differing independent updates. Set `resolved=Y` to apply both remaining Detail rows in Control `order` (later CR wins). A second `row_add` of the same key is still rejected in Stage 2 (`key already exists`).
+  - `cell_overlap` — same table + key + column touched by ≥2 CRs, including when they write the same `new_value` (numeric-aware). Conflicts `notes` distinguish same-value overlaps, sequenced `row_add`/`column_add` + `value_update`, and differing independent updates. Set `resolved=Y` to apply both remaining Detail rows in Control `order` (later CR wins). A second `row_add` of the same key is still rejected in Stage 2 (`key already exists`). After Stage 2, Integration Report `Overlap_Winners` records that later CR, superseded values, and `outcome`.
   - `structural_collision` — ≥2 CRs apply structural changes to the same table
   - `missing_row_column_fill` — a `row_add` and a `column_add` leave their intersection cell with no Change Log value (Stage 2 would otherwise write blank). Supplement with a Detail `value_update` / `row_add` cell for that key+column, or set `resolved=Y` if blank is intentional.
 - User must resolve conflicts (by editing ChangeLog Detail / Control, or marking `resolved=Y`) before Stage 2 can proceed in `apply` mode.
@@ -208,7 +208,10 @@ def integrate_changes(
    - Copy unchanged production tables into the same folder.
    - Preserve exact `!N` + `*` format.
    - Delete the staging folder.
-6. Always produce Integration Report + timestamped audit log. Staging is also deleted on crash.
+6. Always produce Integration Report + timestamped audit log. Staging is also deleted on crash. The Integration Report includes:
+   - `Validation_Report` — existing per-message rows
+   - `Summary` — `status`, `mode`, `n_messages`, `n_failures`, `n_overlap_winners`
+   - `Overlap_Winners` — one row per `cell_overlap` that still involves an `include=Y` + `approved=Y` CR. Winner is the remaining Detail write with the highest Control `order`. Columns: `table_name`, `key_tuple`, `column_name`, `overlapping_change_request_ids`, `winner_change_request_id`, `winner_order`, `winner_change_type`, `winner_new_value`, `superseded_change_request_ids`, `superseded_new_values`, `resolved`, `outcome` (`applied` / `planned` / `blocked_unresolved`). Not written for `structural_collision` or `missing_row_column_fill`. The Change Log Conflicts sheet is not mutated.
 
 ---
 
@@ -223,6 +226,8 @@ Every run writes a `.log` file containing:
 - Number of tables affected
 - Any warnings / conflicts / validation failures
 - Final status (`SUCCESS` / `FAILED` / `DRY_RUN_SUCCESS`)
+
+The Integration Report (not the `.log`) is where cell-overlap last-writer details are recorded (`Overlap_Winners`).
 
 ---
 

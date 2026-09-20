@@ -104,6 +104,22 @@ def _report_messages(report: Path) -> list[dict]:
     ]
 
 
+def _overlap_winner_rows(report: Path) -> list[dict]:
+    wb = load_workbook(report, data_only=True)
+    ws = wb["Overlap_Winners"]
+    n_winners = wb["Summary"]["B5"].value
+    rows = list(ws.iter_rows(values_only=True))
+    wb.close()
+    header = [str(h) for h in rows[0]]
+    data = [
+        {header[i]: row[i] if i < len(row) else None for i in range(len(header))}
+        for row in rows[1:]
+        if row and any(c is not None for c in row)
+    ]
+    assert n_winners == len(data)
+    return data
+
+
 def _setup_add_then_edit(tmp_path: Path) -> Path:
     """CR_A adds a row; CR_B's before includes that row and edits Rate."""
     b1, a1 = _cr_dirs(tmp_path, "CR_A")
@@ -174,6 +190,11 @@ def test_row_add_then_value_update_unresolved_apply_fails(tmp_path: Path):
     wb = load_workbook(report, data_only=True)
     assert wb["Summary"]["B1"].value == "FAILED"
     wb.close()
+    winners = _overlap_winner_rows(report)
+    assert winners
+    assert all(w.get("outcome") == "blocked_unresolved" for w in winners)
+    rate = next(w for w in winners if w.get("column_name") == "Rate")
+    assert rate["winner_change_request_id"] == "CR_B"
     new_dir = tmp_path / "Output" / "New_Production_Tables"
     assert not new_dir.exists() or list(new_dir.glob("*.csv")) == []
     assert _stage2_leftovers(tmp_path) == []
@@ -308,8 +329,8 @@ def test_column_add_then_value_update_apply_after_resolved(tmp_path: Path):
     assert "*,25,1,PROD_A,0.0015,1.05,x" in text
 
 
-def test_differing_value_update_resolved_later_cr_wins(tmp_path: Path):
-    """Differing cell_overlap: resolved=Y applies Control order; later CR wins."""
+def _setup_differing_value_overlap(tmp_path: Path) -> Path:
+    """CR_A and CR_B write different Rate values on the same production cell."""
     b1, a1 = _cr_dirs(tmp_path, "CR_A")
     b2, a2 = _cr_dirs(tmp_path, "CR_B")
     after_a = [PROD[0][:], PROD[1][:]]
@@ -321,7 +342,7 @@ def test_differing_value_update_resolved_later_cr_wins(tmp_path: Path):
     _write_csv(a1 / "MORT_TABLE.csv", after_a)
     _write_csv(b2 / "MORT_TABLE.csv", PROD)
     _write_csv(a2 / "MORT_TABLE.csv", after_b)
-    control = _write_control(
+    return _write_control(
         tmp_path,
         [
             ("CR_A", 1, "Y", "Y", "First rate", ""),
@@ -329,6 +350,11 @@ def test_differing_value_update_resolved_later_cr_wins(tmp_path: Path):
         ],
         "SEQ_LAST_WRITER",
     )
+
+
+def test_differing_value_update_resolved_later_cr_wins(tmp_path: Path):
+    """Differing cell_overlap: resolved=Y applies Control order; later CR wins."""
+    control = _setup_differing_value_overlap(tmp_path)
     clog = generate_change_log(control)
     _mark_conflicts_resolved(clog)
     report = integrate_changes(control, clog, "apply")
@@ -341,6 +367,41 @@ def test_differing_value_update_resolved_later_cr_wins(tmp_path: Path):
     assert "*,20,1,PROD_A,0.0019,1.05" in text
     assert "0.0018" not in text
     assert _stage2_leftovers(tmp_path) == []
+    winners = _overlap_winner_rows(report)
+    assert len(winners) == 1
+    row = winners[0]
+    assert row["table_name"] == "MORT_TABLE"
+    assert row["key_tuple"] == "20|1|PROD_A"
+    assert row["column_name"] == "Rate"
+    assert row["overlapping_change_request_ids"] == "CR_A, CR_B"
+    assert row["winner_change_request_id"] == "CR_B"
+    assert row["winner_order"] == 2
+    assert row["winner_change_type"] == "value_update"
+    assert row["winner_new_value"] == "0.0019"
+    assert row["superseded_change_request_ids"] == "CR_A"
+    assert row["superseded_new_values"] == "CR_A=0.0018"
+    assert str(row["resolved"]).strip().upper() in {"Y", "YES", "TRUE", "1"}
+    assert row["outcome"] == "applied"
+
+
+def test_differing_value_update_validate_only_planned_winner(tmp_path: Path):
+    """validate_only with resolved=Y records the same later-CR winner as planned."""
+    control = _setup_differing_value_overlap(tmp_path)
+    clog = generate_change_log(control)
+    _mark_conflicts_resolved(clog)
+    report = integrate_changes(control, clog, "validate_only")
+    wb = load_workbook(report, data_only=True)
+    assert wb["Summary"]["B1"].value == "DRY_RUN_SUCCESS"
+    wb.close()
+    winners = _overlap_winner_rows(report)
+    assert len(winners) == 1
+    row = winners[0]
+    assert row["winner_change_request_id"] == "CR_B"
+    assert row["winner_new_value"] == "0.0019"
+    assert row["superseded_new_values"] == "CR_A=0.0018"
+    assert row["outcome"] == "planned"
+    new_dir = tmp_path / "Output" / "New_Production_Tables"
+    assert not new_dir.exists() or list(new_dir.glob("*.csv")) == []
 
 
 def _setup_two_tables_add_then_edit(tmp_path: Path) -> Path:

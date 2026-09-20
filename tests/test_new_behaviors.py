@@ -462,6 +462,83 @@ def test_cell_overlap_column_add_then_value_update_notes():
     assert "same new_value" not in overlap[0]["notes"]
 
 
+def test_cell_overlap_three_crs_lists_all_ids():
+    """Three CRs on the same cell produce one overlap listing every CR id."""
+    rows = [
+        _cr("CR_A", "value_update", key_tuple="20|1|PROD_A", column_name="Rate", new_value="0.0017"),
+        _cr("CR_B", "value_update", key_tuple="20|1|PROD_A", column_name="Rate", new_value="0.0018"),
+        _cr("CR_C", "value_update", key_tuple="20|1|PROD_A", column_name="Rate", new_value="0.0019"),
+        _cr("CR_D", "value_update", key_tuple="25|1|PROD_A", column_name="Rate", new_value="0.0016"),
+    ]
+    conflicts = detect_conflicts(rows)
+    overlap = [c for c in conflicts if c["conflict_type"] == "cell_overlap"]
+    assert len(overlap) == 1
+    assert overlap[0]["key_tuple"] == "20|1|PROD_A"
+    assert overlap[0]["change_request_ids"] == ["CR_A", "CR_B", "CR_C"]
+    assert overlap[0]["resolved"] == "N"
+    assert sorted(overlap[0]["new_values"]) == ["0.0017", "0.0018", "0.0019"]
+
+
+def test_cell_overlap_row_delete_and_value_update():
+    """A delete and an update on the same cell is still cell_overlap."""
+    rows = [
+        _cr(
+            "CR_A",
+            "row_delete",
+            key_tuple="25|1|PROD_A",
+            column_name="Rate",
+            old_value="0.0015",
+        ),
+        _cr(
+            "CR_B",
+            "value_update",
+            key_tuple="25|1|PROD_A",
+            column_name="Rate",
+            old_value="0.0015",
+            new_value="0.0016",
+        ),
+    ]
+    conflicts = detect_conflicts(rows)
+    overlap = [c for c in conflicts if c["conflict_type"] == "cell_overlap"]
+    assert len(overlap) == 1
+    assert overlap[0]["change_request_ids"] == ["CR_A", "CR_B"]
+    assert set(overlap[0]["change_types"]) == {"row_delete", "value_update"}
+
+
+def test_structural_collision_two_crs_same_table():
+    """Any structural types from two CRs on the same table collide."""
+    rows = [
+        _cr("CR_A", "column_add", column_name="NewCol"),
+        _cr("CR_B", "column_delete", column_name="Loading"),
+    ]
+    conflicts = detect_conflicts(rows)
+    struct = [c for c in conflicts if c["conflict_type"] == "structural_collision"]
+    assert len(struct) == 1
+    assert struct[0]["table_name"] == "MORT_TABLE"
+    assert struct[0]["change_request_ids"] == ["CR_A", "CR_B"]
+    assert struct[0]["resolved"] == "N"
+    assert set(struct[0]["change_types"]) == {"column_add", "column_delete"}
+
+
+def test_structural_collision_same_cr_no_false_positive():
+    """Several structural edits inside one CR are not a collision."""
+    rows = [
+        _cr("CR_A", "column_add", column_name="NewCol"),
+        _cr("CR_A", "column_delete", column_name="Loading"),
+    ]
+    conflicts = detect_conflicts(rows)
+    assert not any(c["conflict_type"] == "structural_collision" for c in conflicts)
+
+
+def test_structural_collision_different_tables_no_false_positive():
+    rows = [
+        _cr("CR_A", "column_add", column_name="NewCol", table_name="MORT_TABLE"),
+        _cr("CR_B", "column_add", column_name="ExtraCol", table_name="EXPENSE_TABLE"),
+    ]
+    conflicts = detect_conflicts(rows)
+    assert not any(c["conflict_type"] == "structural_collision" for c in conflicts)
+
+
 def _prophet_table(columns: list[str], rows: list[dict[str, str]], n_keys: int = 2) -> ProphetTable:
     data = {c: [r[c] for r in rows] for c in columns}
     return ProphetTable(

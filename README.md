@@ -197,7 +197,7 @@ Checks that the Change Log can be applied cleanly against current production. To
 - Column renames are declared; key-count changes are approved
 - Unresolved conflicts are listed as FAIL rows (see [Conflicts](#conflicts))
 
-Writes `Output/IntegrationReport_<run_id>.xlsx` and an audit log. **Does not write** any files under `New_Production_Tables/`.
+Writes `Output/IntegrationReport_<run_id>.xlsx` and an audit log. **Does not write** any files under `New_Production_Tables/`. The report includes `Validation_Report`, `Summary` (`n_overlap_winners`), and **`Overlap_Winners`**: one row per `cell_overlap` still involving an included, approved CR. The later CR in Control `order` is recorded as the winner (`outcome` is `planned` when `resolved=Y`, or `blocked_unresolved` when it is not).
 
 ```bash
 python -m prophet_table_tool WorkingRoot\Control.xlsx --mode validate_only
@@ -210,7 +210,7 @@ Same validation as above. Each finished table is spilled to a temporary `Output/
 
 `Output/New_Production_Tables/`
 
-Filenames and `!N` / `*` format are preserved. Production input files are not overwritten in place. The staging folder is deleted after publish, on validation failure, and if the run crashes.
+Filenames and `!N` / `*` format are preserved. Production input files are not overwritten in place. The staging folder is deleted after publish, on validation failure, and if the run crashes. The same Integration Report **`Overlap_Winners`** sheet is written; `outcome=applied` when `resolved=Y` and the run is not conflict-blocked.
 
 ```bash
 python -m prophet_table_tool WorkingRoot\Control.xlsx --mode apply
@@ -253,7 +253,7 @@ Prefer fixing the **source** (Control and/or `before/` / `after/`) and **re-runn
 
 **`cell_overlap`** — still listed with `resolved=N`. Conflicts `notes` say whether the `new_value`s agree, and whether this is a sequenced `row_add` / `column_add` plus `value_update`.
 
-Set `resolved = Y` to accept the overlap and apply **both** remaining Detail rows in Control `order`. The **later** CR’s value is the one that remains in the cell. You do not have to delete a Detail row when the values differ.
+Set `resolved = Y` to accept the overlap and apply **both** remaining Detail rows in Control `order`. The **later** CR’s value is the one that remains in the cell. You do not have to delete a Detail row when the values differ. After `validate_only` or `apply`, Integration Report **`Overlap_Winners`** lists that winner, the superseded CR values, and `outcome` (`planned` / `applied` / `blocked_unresolved`).
 
 Typical cases:
 
@@ -290,7 +290,7 @@ Then run `validate_only`, and only then `apply`.
 | `ChangeLog_*.xlsx` | Stage 1 (Summary / Conflicts / ReviewFiles index) |
 | `ChangeLog_*_Detail.csv` | Stage 1 (Stage 2 source of truth) |
 | `ChangeLog_*_reviews/*.xlsx` | Stage 1 (human review, split by first-level folder) |
-| `IntegrationReport_*.xlsx` | Stage 2 |
+| `IntegrationReport_*.xlsx` | Stage 2 (`Validation_Report`, `Summary`, `Overlap_Winners`) |
 | `New_Production_Tables/*.csv` | Stage 2 `apply` only |
 | `Output/Audit/*.log` | Every run |
 

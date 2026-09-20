@@ -14,7 +14,7 @@ from openpyxl.styles import Font
 
 from .audit import close_audit_logger, setup_audit_logger
 from .control import ControlConfig, read_control
-from .diff import ChangeRow
+from .diff import CELL_TYPES, ChangeRow
 from .prophet_csv import (
     ProphetTable,
     discover_csv_tables,
@@ -34,6 +34,21 @@ REPORT_HEADERS = [
     "column_name",
     "message",
     "severity",
+]
+
+OVERLAP_WINNER_HEADERS = [
+    "table_name",
+    "key_tuple",
+    "column_name",
+    "overlapping_change_request_ids",
+    "winner_change_request_id",
+    "winner_order",
+    "winner_change_type",
+    "winner_new_value",
+    "superseded_change_request_ids",
+    "superseded_new_values",
+    "resolved",
+    "outcome",
 ]
 
 
@@ -66,6 +81,7 @@ def integrate_changes(
     status = "FAILED"
     report_path = control.output_path / f"IntegrationReport_{run_id}.xlsx"
     validation_messages: list[dict] = []
+    overlap_winners: list[dict] = []
     staging_dir = control.output_path / f".stage2_{run_id}"
 
     try:
@@ -99,6 +115,10 @@ def integrate_changes(
             if not yn_to_bool(c.get("resolved", "N"))
             and any(cid in cr_ids for cid in c.get("change_request_ids", []))
         ]
+        conflict_failed = bool(unresolved)
+        overlap_winners = _overlap_winner_records(
+            conflicts, detail_rows, cr_order, cr_ids, mode, conflict_failed
+        )
         if unresolved:
             for c in unresolved:
                 msg = (
@@ -112,7 +132,9 @@ def integrate_changes(
                 logger.error(msg)
             if mode == "apply":
                 status = "FAILED"
-                _write_integration_report(report_path, validation_messages, status, mode)
+                _write_integration_report(
+                    report_path, validation_messages, status, mode, overlap_winners
+                )
                 logger.info("final_status=%s", status)
                 return report_path
 
@@ -190,9 +212,11 @@ def integrate_changes(
                 staged_names.add(table_name)
             del tables
 
-        if not ok:
+        if not ok or conflict_failed:
             status = "FAILED"
-            _write_integration_report(report_path, validation_messages, status, mode)
+            _write_integration_report(
+                report_path, validation_messages, status, mode, overlap_winners
+            )
             logger.info(
                 "n_validation_failures=%d",
                 sum(1 for m in validation_messages if m["severity"] == "FAIL"),
@@ -214,7 +238,9 @@ def integrate_changes(
                     "INFO",
                 )
             )
-            _write_integration_report(report_path, validation_messages, status, mode)
+            _write_integration_report(
+                report_path, validation_messages, status, mode, overlap_winners
+            )
             logger.info("tables_affected=%d", len(touched))
             logger.info("final_status=%s", status)
             return report_path
@@ -267,7 +293,9 @@ def integrate_changes(
             _vmsg("summary", "", "", "", "", "", f"Wrote {written} table(s) to {out_dir}", "INFO")
         )
         status = "SUCCESS"
-        _write_integration_report(report_path, validation_messages, status, mode)
+        _write_integration_report(
+            report_path, validation_messages, status, mode, overlap_winners
+        )
         logger.info("tables_affected=%d", written)
         logger.info("output_dir=%s", out_dir)
         logger.info("final_status=%s", status)
@@ -279,7 +307,9 @@ def integrate_changes(
             _vmsg("error", "", "", "", "", "", str(exc), "FAIL")
         )
         try:
-            _write_integration_report(report_path, validation_messages, status, mode)
+            _write_integration_report(
+                report_path, validation_messages, status, mode, overlap_winners
+            )
         except Exception:
             pass
         logger.info("final_status=%s", status)
@@ -743,12 +773,82 @@ def _apply_table_changes(
     )
 
 
+def _overlap_outcome(mode: str, resolved: object, conflict_failed: bool) -> str:
+    if not yn_to_bool(resolved):
+        return "blocked_unresolved"
+    if mode == "apply" and not conflict_failed:
+        return "applied"
+    return "planned"
+
+
+def _overlap_winner_records(
+    conflicts: list[dict],
+    detail_rows: list[ChangeRow],
+    cr_order: dict[str, int],
+    cr_ids: set[str],
+    mode: str,
+    conflict_failed: bool,
+) -> list[dict]:
+    """Last-writer per cell_overlap from remaining Detail rows and Control order."""
+    by_cell: dict[tuple[str, str, str], dict[str, ChangeRow]] = defaultdict(dict)
+    for row in detail_rows:
+        if row.change_type not in CELL_TYPES or row.change_request_id not in cr_ids:
+            continue
+        cell = (row.table_name, row.key_tuple, row.column_name)
+        by_cell[cell][row.change_request_id] = row
+
+    winners: list[dict] = []
+    for conflict in conflicts:
+        if conflict.get("conflict_type") != "cell_overlap":
+            continue
+        listed = [cid for cid in conflict.get("change_request_ids", []) if cid in cr_ids]
+        if not listed:
+            continue
+        table = str(conflict.get("table_name") or "")
+        key_tuple = str(conflict.get("key_tuple") or "")
+        column = str(conflict.get("column_name") or "")
+        listed_set = set(listed)
+        writes = {
+            cid: row
+            for cid, row in by_cell.get((table, key_tuple, column), {}).items()
+            if cid in listed_set
+        }
+        if not writes:
+            continue
+        ordered_ids = sorted(writes, key=lambda cid: (cr_order.get(cid, 10**9), cid))
+        winner_id = ordered_ids[-1]
+        winner_row = writes[winner_id]
+        superseded_ids = ordered_ids[:-1]
+        resolved = conflict.get("resolved", "N")
+        winners.append(
+            {
+                "table_name": table,
+                "key_tuple": key_tuple,
+                "column_name": column,
+                "overlapping_change_request_ids": ", ".join(ordered_ids),
+                "winner_change_request_id": winner_id,
+                "winner_order": cr_order.get(winner_id, ""),
+                "winner_change_type": winner_row.change_type,
+                "winner_new_value": winner_row.new_value,
+                "superseded_change_request_ids": ", ".join(superseded_ids),
+                "superseded_new_values": ", ".join(
+                    f"{cid}={writes[cid].new_value}" for cid in superseded_ids
+                ),
+                "resolved": resolved,
+                "outcome": _overlap_outcome(mode, resolved, conflict_failed),
+            }
+        )
+    return winners
+
+
 def _write_integration_report(
     path: Path,
     messages: list[dict],
     status: str,
     mode: str,
+    overlap_winners: list[dict] | None = None,
 ) -> None:
+    winners = overlap_winners or []
     wb = Workbook()
     ws = wb.active
     ws.title = "Validation_Report"
@@ -773,6 +873,16 @@ def _write_integration_report(
     ws2["B3"] = len(messages)
     ws2["A4"] = "n_failures"
     ws2["B4"] = sum(1 for m in messages if m.get("severity") == "FAIL")
+    ws2["A5"] = "n_overlap_winners"
+    ws2["B5"] = len(winners)
+
+    ws3 = wb.create_sheet("Overlap_Winners")
+    for j, h in enumerate(OVERLAP_WINNER_HEADERS, start=1):
+        cell = ws3.cell(1, j, h)
+        cell.font = bold
+    for i, row in enumerate(winners, start=2):
+        for j, key in enumerate(OVERLAP_WINNER_HEADERS, start=1):
+            ws3.cell(i, j, row.get(key, ""))
 
     path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(path)

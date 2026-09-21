@@ -18,6 +18,7 @@ from prophet_table_tool.changelog_review import (
 )
 from prophet_table_tool.control import ControlConfig
 from prophet_table_tool.diff import ChangeRow, detect_conflicts, diff_table
+from prophet_table_tool.integrate import _apply_table_changes
 from prophet_table_tool.prophet_csv import (
     ProphetTable,
     discover_csv_tables,
@@ -546,6 +547,43 @@ def _prophet_table(columns: list[str], rows: list[dict[str, str]], n_keys: int =
         columns=columns,
         data=pl.DataFrame(data, schema={c: pl.Utf8 for c in columns}),
     )
+
+
+def test_value_update_sparse_columns_beyond_infer_schema_length():
+    """Wide sparse updates must not infer Null/Int from the first 100 keys."""
+    columns = ["Age", "Rate", "Product"]
+    n = 101
+    prod_rows = [
+        {"Age": str(i), "Rate": "0.1", "Product": "OLD"} for i in range(n)
+    ]
+    table = _prophet_table(columns, prod_rows)
+    updates = [
+        _cr("CR_A", "value_update", key_tuple=str(i), column_name="Rate", new_value="0.2")
+        for i in range(100)
+    ]
+    updates.append(
+        _cr(
+            "CR_A",
+            "value_update",
+            key_tuple="100",
+            column_name="Product",
+            new_value="PROD_A",
+        )
+    )
+    result = _apply_table_changes(
+        _minimal_control(),
+        "CR_A",
+        "MORT_TABLE",
+        updates,
+        {"MORT_TABLE": table},
+    )
+    by_age = {row["Age"]: row for row in result.data.iter_rows(named=True)}
+    assert by_age["0"]["Rate"] == "0.2"
+    assert by_age["0"]["Product"] == "OLD"
+    assert by_age["99"]["Rate"] == "0.2"
+    assert by_age["99"]["Product"] == "OLD"
+    assert by_age["100"]["Rate"] == "0.1"
+    assert by_age["100"]["Product"] == "PROD_A"
 
 
 def _change_cells_by_first_data_col(ws) -> dict[str, str]:

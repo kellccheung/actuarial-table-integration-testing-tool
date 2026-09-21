@@ -726,9 +726,8 @@ def _apply_table_changes(
             if col not in columns:
                 columns.append(col)
         records = [{"_key_str": k, **{c: cv.get(c) for c in update_cols}} for k, cv in by_key.items()]
-        upd = pl.DataFrame(records).with_columns(
-            [pl.col(c).cast(pl.Utf8) for c in update_cols]
-        )
+        schema = {"_key_str": pl.Utf8, **{c: pl.Utf8 for c in update_cols}}
+        upd = pl.DataFrame(records, schema=schema)
         joined = data.join(upd, on="_key_str", how="left", suffix="_new")
         coalesced = [
             pl.coalesce([pl.col(f"{c}_new"), pl.col(c)]).alias(c)

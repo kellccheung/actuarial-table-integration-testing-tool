@@ -295,8 +295,8 @@ def test_t11_idempotent_apply():
     _clean_output(case)
 
     clog = generate_change_log(case / "Control.xlsx")
-    clog_keep = case / "ChangeLog_kept.xlsx"
-    detail_keep = case / "ChangeLog_kept_Detail.csv"
+    clog_keep = case / "Output" / "ChangeLog_kept.xlsx"
+    detail_keep = case / "Output" / "ChangeLog_kept_Detail.csv"
     shutil.copy(clog, clog_keep)
     shutil.copy(clog.with_name(f"{clog.stem}_Detail.csv"), detail_keep)
 

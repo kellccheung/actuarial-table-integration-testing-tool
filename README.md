@@ -103,7 +103,7 @@ Edited on 2026,,,,,
 | Headers | Remaining cells on the `!N` row are column names |
 | Data rows | First cell is always `*`, then key values and data values |
 | Dummy lines | Lines before `!N` and after the last `*` row are ignored for Change Log comparison; Stage 2 keeps production’s dummy lines as-is |
-| Matching | Exact string match only (no floating-point tolerance) |
+| Matching | Numeric when both sides parse as numbers (`1.10` equals `1.1`); otherwise exact string |
 
 Example: `!4` means keys are the marker + the next 3 columns (`Age`, `Duration`, `Product`).
 
@@ -118,7 +118,7 @@ Example: `!4` means keys are the marker + the next 3 columns (`Age`, `Duration`,
 | Key | Example | Description |
 |-----|---------|-------------|
 | `working_root` | `D:\ProphetChanges\2026Q3` | Root folder. Leave blank to use the folder that contains `Control.xlsx`. |
-| `mode` | `generate_changelog` / `validate_only` / `apply` | Default run mode (can be overridden on the CLI) |
+| `mode` | `generate_changelog` / `scan` / `sync_requests` / `validate_only` / `apply` | Default run mode (can be overridden on the CLI) |
 | `production_tables_path` | `Production_Tables` | Relative to working root, or absolute |
 | `output_path` | `Output` | Relative to working root, or absolute |
 | `run_id` | (optional) | If blank, auto-generated as `YYYYMMDD_HHMMSS` |
@@ -133,6 +133,13 @@ Example: `!4` means keys are the marker + the next 3 columns (`Age`, `Duration`,
 | `approved` | `Y` / `N` — required for Stage 2 (`validate_only` and `apply`) |
 | `description` | Short description (shown in Change Log Summary) |
 | `notes` | Optional |
+| `after_path` | Optional. Folder of the changed tables (absolute or network path). Blank uses `ChangeRequests/<id>/after` |
+| `before_source` | Optional. `folder` (default) or `production` |
+| `before_path` | Optional. Used when `before_source` is `folder`. Blank uses `ChangeRequests/<id>/before` |
+
+`before_source=production` compares each table under `after` with the same relative path in `production_tables_path`. A missing production file is a new table. Other production tables are left alone.
+
+`sync_requests` adds a sheet row for each new folder under `ChangeRequests/`, with `include=N` and `approved=N`. Rows already on the sheet are not changed. Set `include=Y` before a run.
 
 ### `ColumnRenames` (optional)
 
@@ -146,11 +153,17 @@ Column renames are **never auto-detected**. Declare them here or Stage 2 will ha
 
 Use when a table’s `!N` changes. Without approval, Stage 2 hard-stops.
 
-| change_request_id | table_name | approved |
-|-------------------|------------|----------|
-| CR_2026Q3_03_… | EXPENSE_TABLE | Y |
+| change_request_id | table_name | approved | before_column | after_column |
+|-------------------|------------|----------|---------------|--------------|
+| CR_2026Q3_03_… | EXPENSE_TABLE | Y | | |
+| CR_2026Q3_04_… | MORT_TABLE | Y | Age | Age |
+| CR_2026Q3_04_… | MORT_TABLE | Y | Duration | Term |
 
-If this sheet has no row for a table, the tool falls back to the CR-level `approved` flag.
+`before_column` and `after_column` are optional. Leave both blank to approve a `!N` change and match on key names that exist on both sides.
+
+When any pair is filled, those pairs are the whole row match. List every key column used to pair rows, in the before table's key order, including names that did not change. A blank `before_column` means that after column became a key. A blank `after_column` means that before column stopped being a key. Those one-sided columns are not used to pair rows. A pair of different names is also a key rename (do not repeat it on `ColumnRenames`).
+
+Every row for that request and table must be `approved=Y`. One `N` blocks Stage 2. If the sheet has no row for the table, the tool falls back to the CR-level `approved` flag.
 
 ---
 
@@ -182,6 +195,12 @@ with encoding fallback: utf-8-sig → utf-8 → cp1252 → latin-1.
 
 ```bash
 python -m prophet_table_tool WorkingRoot\Control.xlsx --mode generate_changelog
+```
+
+`generate_changelog` first writes `Output/StructureScan_<run_id>.xlsx` from each table's `!N` header. Fatal rows (unreadable file, duplicate column names, key columns that do not line up and are not declared) stop the run before any cell diff. You can run that check on its own:
+
+```bash
+python -m prophet_table_tool WorkingRoot\Control.xlsx --mode scan
 ```
 
 **Review the Change Log before continuing.** Prefer the per-folder review workbooks under `ChangeLog_*_reviews/` for visual checks; use the Detail CSV / Conflicts for the machine-readable record. If the Conflicts sheet has rows, resolve them before applying (see [Conflicts](#conflicts)).
@@ -294,7 +313,7 @@ Then run `validate_only`, and only then `apply`.
 | `New_Production_Tables/*.csv` | Stage 2 `apply` only |
 | `Output/Audit/*.log` | Every run |
 
-Each audit log records timestamp, mode, Control/Change Log hashes, CRs processed, warnings, and final status (`SUCCESS` / `FAILED` / `DRY_RUN_SUCCESS`).
+Each audit log line starts with a local timestamp. The log also records mode, Control/Change Log hashes, CRs processed, warnings, and final status (`SUCCESS` / `FAILED` / `DRY_RUN_SUCCESS`).
 
 ---
 
@@ -311,7 +330,7 @@ Each audit log records timestamp, mode, Control/Change Log hashes, CRs processed
 | Table only in `before/` | Warning + skip (no auto-delete) |
 | `validate_only` | Never writes new production tables |
 
-Matching is **exact string** only. Re-running the same Change Log on the same production snapshot is designed to be **idempotent**.
+Matching is **numeric-aware** (`1.10` equals `1.1`); other values must match as text. Re-running the same Change Log on the same production snapshot is designed to be **idempotent**.
 
 ---
 

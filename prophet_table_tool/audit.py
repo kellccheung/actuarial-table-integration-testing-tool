@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -28,16 +27,17 @@ def setup_audit_logger(
 
     fh = logging.FileHandler(log_path, encoding="utf-8")
     fh.setLevel(logging.DEBUG)
-    fh.setFormatter(logging.Formatter("%(message)s"))
+    fh.setFormatter(logging.Formatter("%(asctime)s %(message)s", datefmt="%Y-%m-%dT%H:%M:%S%z"))
     logger.addHandler(fh)
 
     # Also echo INFO+ to stderr so users see per-table progress
     sh = logging.StreamHandler()
     sh.setLevel(logging.INFO)
-    sh.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+    sh.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s: %(message)s", datefmt="%Y-%m-%dT%H:%M:%S%z")
+    )
     logger.addHandler(sh)
 
-    logger.info("timestamp=%s", datetime.now(timezone.utc).isoformat())
     logger.info("run_id=%s", run_id)
     logger.info("mode=%s", mode)
     return logger, log_path

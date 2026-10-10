@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import polars as pl
+import pytest
 from openpyxl import Workbook, load_workbook
 
 from prophet_table_tool.changelog import generate_change_log
@@ -505,3 +506,111 @@ def test_mixed_cr_failure_per_table_apply_then_overall_fail(tmp_path: Path):
     new_dir = tmp_path / "Output" / "New_Production_Tables"
     assert not new_dir.exists() or list(new_dir.glob("*.csv")) == []
     assert _stage2_leftovers(tmp_path) == []
+
+
+def test_two_new_columns_keep_after_order(tmp_path: Path):
+    b, a = _cr_dirs(tmp_path, "CR")
+    cols_before = ["Age", "Rate"]
+    cols_after = ["Age", "Duration", "Rate", "Loading"]
+    _write_table(tmp_path / "Production_Tables" / "MORT_TABLE.csv", cols_before, 2, [["20", "0.1"]])
+    _write_table(b / "MORT_TABLE.csv", cols_before, 2, [["20", "0.1"]])
+    _write_table(a / "MORT_TABLE.csv", cols_after, 3, [["20", "1", "0.2", "1.5"]])
+    control = _write_control(tmp_path, [("CR", 1, "Y", "Y", "add key and value", "")], "COL_ORDER")
+    clog = generate_change_log(control)
+    report = integrate_changes(control, clog, "apply")
+    wb = load_workbook(report, data_only=True)
+    assert wb["Summary"]["B1"].value == "SUCCESS"
+    wb.close()
+    text = (tmp_path / "Output" / "New_Production_Tables" / "MORT_TABLE.csv").read_text(
+        encoding="utf-8"
+    )
+    assert text.splitlines()[0] == "!3,Age,Duration,Rate,Loading"
+    assert "*,20,1,0.2,1.5" in text
+
+
+def test_promote_existing_column_applies_rate(tmp_path: Path):
+    b, a = _cr_dirs(tmp_path, "CR")
+    cols = ["Age", "Duration", "Rate"]
+    _write_table(tmp_path / "Production_Tables" / "MORT_TABLE.csv", cols, 2, [["20", "1", "0.1"]])
+    _write_table(b / "MORT_TABLE.csv", cols, 2, [["20", "1", "0.1"]])
+    _write_table(a / "MORT_TABLE.csv", cols, 3, [["20", "1", "0.2"]])
+    control = _write_control(tmp_path, [("CR", 1, "Y", "Y", "promote Duration", "")], "PROMOTE")
+    clog = generate_change_log(control)
+    report = integrate_changes(control, clog, "apply")
+    wb = load_workbook(report, data_only=True)
+    assert wb["Summary"]["B1"].value == "SUCCESS"
+    wb.close()
+    text = (tmp_path / "Output" / "New_Production_Tables" / "MORT_TABLE.csv").read_text(
+        encoding="utf-8"
+    )
+    assert text.splitlines()[0] == "!3,Age,Duration,Rate"
+    assert "*,20,1,0.2" in text
+
+
+def test_duplicate_production_key_apply_writes_nothing(tmp_path: Path):
+    b, a = _cr_dirs(tmp_path, "CR")
+    cols = ["Age", "Rate"]
+    _write_table(
+        tmp_path / "Production_Tables" / "MORT_TABLE.csv",
+        cols,
+        2,
+        [["20", "0.1"], ["20", "0.2"]],
+    )
+    _write_table(b / "MORT_TABLE.csv", cols, 2, [["20", "0.1"]])
+    _write_table(a / "MORT_TABLE.csv", cols, 2, [["20", "0.3"]])
+    control = _write_control(tmp_path, [("CR", 1, "Y", "Y", "dup", "")], "DUP_KEY")
+    clog = generate_change_log(control)
+    with pytest.raises(ValueError, match="duplicate key"):
+        integrate_changes(control, clog, "apply")
+    new_dir = tmp_path / "Output" / "New_Production_Tables"
+    assert not new_dir.exists() or list(new_dir.glob("*")) == []
+
+
+def test_apply_drops_stale_output_and_old_staging(tmp_path: Path):
+    b, a = _cr_dirs(tmp_path, "CR")
+    cols = ["Age", "Rate"]
+    _write_table(tmp_path / "Production_Tables" / "MORT_TABLE.csv", cols, 2, [["20", "0.1"]])
+    _write_table(b / "MORT_TABLE.csv", cols, 2, [["20", "0.1"]])
+    _write_table(a / "MORT_TABLE.csv", cols, 2, [["20", "0.2"]])
+    control = _write_control(tmp_path, [("CR", 1, "Y", "Y", "rate", "")], "SWAP_RUN")
+    stale = tmp_path / "Output" / "New_Production_Tables" / "OLD_TABLE.csv"
+    stale.parent.mkdir(parents=True)
+    stale.write_text("stale\n", encoding="utf-8")
+    planted = tmp_path / "Output" / ".stage2_SWAP_RUN" / "MORT_TABLE.csv"
+    planted.parent.mkdir(parents=True)
+    planted.write_text("PLANTED\n", encoding="utf-8")
+    clog = generate_change_log(control)
+    integrate_changes(control, clog, "apply")
+    out = tmp_path / "Output" / "New_Production_Tables" / "MORT_TABLE.csv"
+    text = out.read_text(encoding="utf-8")
+    assert "0.2" in text
+    assert "PLANTED" not in text
+    assert not stale.exists()
+    assert _stage2_leftovers(tmp_path) == []
+
+
+def test_table_add_keeps_fac_suffix_and_banner(tmp_path: Path):
+    _b, a = _cr_dirs(tmp_path, "CR")
+    (a / "NEW.FAC").write_text("Prophet banner\n!2,Age,Rate\n*,20,0.1\n", encoding="utf-8")
+    (tmp_path / "Production_Tables").mkdir()
+    control = _write_control(tmp_path, [("CR", 1, "Y", "Y", "add fac", "")], "FAC_ADD")
+    clog = generate_change_log(control)
+    integrate_changes(control, clog, "apply")
+    text = (tmp_path / "Output" / "New_Production_Tables" / "NEW.FAC").read_text(encoding="utf-8")
+    assert text.startswith("Prophet banner\n")
+    assert "*,20,0.1" in text
+
+
+def test_apply_keeps_crlf(tmp_path: Path):
+    b, a = _cr_dirs(tmp_path, "CR")
+    before = b"!2,Age,Rate\r\n*,20,0.1\r\n"
+    after = b"!2,Age,Rate\r\n*,20,0.2\r\n"
+    (tmp_path / "Production_Tables").mkdir()
+    (tmp_path / "Production_Tables" / "MORT_TABLE.csv").write_bytes(before)
+    (b / "MORT_TABLE.csv").write_bytes(before)
+    (a / "MORT_TABLE.csv").write_bytes(after)
+    control = _write_control(tmp_path, [("CR", 1, "Y", "Y", "crlf", "")], "CRLF")
+    clog = generate_change_log(control)
+    integrate_changes(control, clog, "apply")
+    written = (tmp_path / "Output" / "New_Production_Tables" / "MORT_TABLE.csv").read_bytes()
+    assert b"*,20,0.2\r\n" in written

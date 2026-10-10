@@ -6,8 +6,10 @@ import argparse
 import sys
 from pathlib import Path
 
-from .changelog import generate_change_log
-from .control import ControlConfig, read_control
+from openpyxl import load_workbook
+
+from .changelog import StructureScanError, generate_change_log, run_structure_scan
+from .control import ControlConfig, read_control, sync_change_requests
 from .integrate import integrate_changes
 
 
@@ -56,6 +58,15 @@ def _resolve_change_log(
     raise ChangeLogResolveError(f"Change Log not found: {explicit}")
 
 
+def _integration_failed(path: Path) -> bool:
+    """True when the Integration Report Summary status is FAILED."""
+    wb = load_workbook(path, data_only=True, read_only=True)
+    try:
+        return str(wb["Summary"]["B1"].value or "") == "FAILED"
+    finally:
+        wb.close()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Prophet Table Change Consolidation & Integration Tool",
@@ -76,7 +87,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--mode",
-        choices=["generate_changelog", "validate_only", "apply"],
+        choices=["generate_changelog", "validate_only", "apply", "scan", "sync_requests"],
         default=None,
         help="Override mode from Control.xlsx Config sheet",
     )
@@ -86,8 +97,31 @@ def main(argv: list[str] | None = None) -> int:
     mode = args.mode or control.mode
     print(f"Mode: {mode}")
 
+    if mode == "sync_requests":
+        added, missing = sync_change_requests(args.control)
+        if added:
+            print("Added change request(s) with include=N:")
+            for cr_id in added:
+                print(f"  {cr_id}")
+        else:
+            print("No new change request folders to add.")
+        for cr_id in missing:
+            print(f"Warning: {cr_id} is on the sheet but has no folder.")
+        return 0
+
+    if mode == "scan":
+        scan_path, findings = run_structure_scan(control)
+        n_fatal = sum(1 for row in findings if row["severity"] == "FATAL")
+        print(f"Structure scan written to: {scan_path}")
+        print(f"Findings: {len(findings)} ({n_fatal} fatal)")
+        return 1 if n_fatal else 0
+
     if mode == "generate_changelog":
-        out = generate_change_log(args.control, control=control)
+        try:
+            out = generate_change_log(args.control, control=control)
+        except StructureScanError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
         print(f"Change Log written to: {out}")
         return 0
 
@@ -100,7 +134,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Using Change Log: {change_log}")
         out = integrate_changes(args.control, change_log, "validate_only", control=control)
         print(f"Integration Report written to: {out}")
-        return 0
+        return 1 if _integration_failed(out) else 0
 
     if mode == "apply":
         try:
@@ -111,7 +145,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Using Change Log: {change_log}")
         out = integrate_changes(args.control, change_log, "apply", control=control)
         print(f"Integration Report written to: {out}")
-        return 0
+        return 1 if _integration_failed(out) else 0
 
     print(f"Unknown mode: {mode!r}", file=sys.stderr)
     return 1

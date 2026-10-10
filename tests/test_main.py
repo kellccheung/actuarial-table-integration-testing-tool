@@ -7,8 +7,10 @@ from pathlib import Path
 
 import pytest
 
-from prophet_table_tool.__main__ import ChangeLogResolveError, _resolve_change_log
+from prophet_table_tool.__main__ import ChangeLogResolveError, _resolve_change_log, main
+from prophet_table_tool.changelog import generate_change_log
 from prophet_table_tool.control import ControlConfig
+from test_sequential_apply import _cr_dirs, _write_control, _write_table
 
 
 def _control(tmp_path: Path) -> ControlConfig:
@@ -78,6 +80,19 @@ def test_resolve_bare_filename_missing(tmp_path: Path):
     control.output_path.mkdir()
     with pytest.raises(ChangeLogResolveError, match="Change Log not found"):
         _resolve_change_log(control, Path("ChangeLog_MISSING.xlsx"))
+
+
+def test_apply_failed_report_exits_nonzero(tmp_path: Path):
+    b, a = _cr_dirs(tmp_path, "CR")
+    cols = ["Age", "Rate"]
+    prod = tmp_path / "Production_Tables" / "MORT_TABLE.csv"
+    _write_table(prod, cols, 2, [["20", "0.1"]])
+    _write_table(b / "MORT_TABLE.csv", cols, 2, [["20", "0.1"]])
+    _write_table(a / "MORT_TABLE.csv", cols, 2, [["20", "0.2"]])
+    control = _write_control(tmp_path, [("CR", 1, "Y", "Y", "missing prod", "")], "EXIT1")
+    clog = generate_change_log(control)
+    prod.unlink()
+    assert main([str(control), "--mode", "apply", "--change-log", str(clog)]) == 1
 
 
 def test_resolve_missing_explicit_path(tmp_path: Path):

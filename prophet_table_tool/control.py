@@ -7,6 +7,7 @@ from pathlib import Path
 
 from openpyxl import load_workbook
 
+from .prophet_csv import discover_csv_tables
 from .utils import resolve_path, yn_to_bool
 
 
@@ -18,6 +19,9 @@ class ChangeRequestRow:
     approved: bool
     description: str = ""
     notes: str = ""
+    after_path: str = ""
+    before_source: str = ""
+    before_path: str = ""
 
 
 @dataclass
@@ -33,6 +37,8 @@ class KeyCountApproval:
     change_request_id: str
     table_name: str
     approved: bool
+    before_column: str = ""
+    after_column: str = ""
 
 
 @dataclass
@@ -65,18 +71,93 @@ class ControlConfig:
         ]
 
     def is_key_count_approved(self, change_request_id: str, table_name: str) -> bool:
-        """True if KeyCountApprovals says Y, or the CR itself is approved."""
-        for row in self.key_count_approvals:
-            if (
-                row.change_request_id == change_request_id
-                and row.table_name == table_name
-            ):
-                return row.approved
-        # Fall back to CR-level approved flag
+        """True when every KeyCountApprovals row for this table is Y.
+
+        No row for the table falls back to the change request's approved flag.
+        One N blocks the table.
+        """
+        rows = [
+            row
+            for row in self.key_count_approvals
+            if row.change_request_id == change_request_id and row.table_name == table_name
+        ]
+        if rows:
+            return all(row.approved for row in rows)
         for cr in self.change_requests:
             if cr.change_request_id == change_request_id:
                 return cr.approved
         return False
+
+    def key_column_pairs(
+        self, change_request_id: str, table_name: str
+    ) -> list[tuple[str, str]]:
+        """Filled KeyCountApprovals column pairs for one request and table."""
+        pairs: list[tuple[str, str]] = []
+        for row in self.key_count_approvals:
+            if row.change_request_id != change_request_id or row.table_name != table_name:
+                continue
+            before_col = row.before_column.strip()
+            after_col = row.after_column.strip()
+            if before_col or after_col:
+                pairs.append((before_col, after_col))
+        return pairs
+
+    def cr_locations(self, cr: ChangeRequestRow) -> tuple[Path | None, Path, bool]:
+        """Return ``(before_dir, after_dir, production_before)``.
+
+        ``before_dir`` is None when before comes from the production tables.
+        """
+        source = (cr.before_source or "").strip().lower()
+        if source not in {"", "folder", "production"}:
+            raise ValueError(
+                f"[{cr.change_request_id}] before_source must be folder or production, "
+                f"got {cr.before_source!r}"
+            )
+        if cr.after_path.strip():
+            after_dir = resolve_path(self.working_root, cr.after_path.strip())
+        else:
+            after_dir = self.change_request_dir(cr.change_request_id) / "after"
+        if source == "production":
+            return None, after_dir, True
+        if cr.before_path.strip():
+            before_dir = resolve_path(self.working_root, cr.before_path.strip())
+        else:
+            before_dir = self.change_request_dir(cr.change_request_id) / "before"
+        return before_dir, after_dir, False
+
+    def discover_cr_tables(
+        self, cr: ChangeRequestRow
+    ) -> tuple[dict[str, Path], dict[str, Path], bool]:
+        """Map table identity to path for one request.
+
+        Production before only includes tables that also exist under after.
+        """
+        before_dir, after_dir, production = self.cr_locations(cr)
+        after_tables = discover_csv_tables(after_dir)
+        if production:
+            before_tables: dict[str, Path] = {}
+            for name in after_tables:
+                prod = self._production_table(name)
+                if prod is not None:
+                    before_tables[name] = prod
+            return before_tables, after_tables, True
+        assert before_dir is not None
+        return discover_csv_tables(before_dir), after_tables, False
+
+    def _production_table(self, identity: str) -> Path | None:
+        """Production file for a table identity. ``.FAC`` wins over ``.csv``."""
+        base = self.production_tables_path / identity
+        found_csv: Path | None = None
+        found_fac: Path | None = None
+        for ext in (".csv", ".CSV", ".fac", ".FAC"):
+            candidate = base.with_suffix(ext)
+            if not candidate.is_file():
+                continue
+            if ext.lower() == ".fac":
+                found_fac = candidate
+            else:
+                found_csv = candidate
+        return found_fac or found_csv
 
 
 def read_control(control_path: Path) -> ControlConfig:
@@ -173,6 +254,9 @@ def _read_change_requests(wb) -> list[ChangeRequestRow]:
                 approved=yn_to_bool(_cell(row, col_index, "approved", 3)),
                 description=str(_cell(row, col_index, "description", 4) or ""),
                 notes=str(_cell(row, col_index, "notes", 5) or ""),
+                after_path=str(_cell(row, col_index, "after_path", 6) or ""),
+                before_source=str(_cell(row, col_index, "before_source", 7) or ""),
+                before_path=str(_cell(row, col_index, "before_path", 8) or ""),
             )
         )
     return result
@@ -223,15 +307,63 @@ def _read_key_count_approvals(wb) -> list[KeyCountApproval]:
         cr_id = str(_cell(row, col_index, "change_request_id", 0) or "").strip()
         table = str(_cell(row, col_index, "table_name", 1) or "").strip()
         approved = yn_to_bool(_cell(row, col_index, "approved", 2))
+        before_col = str(_cell(row, col_index, "before_column", 3) or "").strip()
+        after_col = str(_cell(row, col_index, "after_column", 4) or "").strip()
         if cr_id and table:
             result.append(
                 KeyCountApproval(
                     change_request_id=cr_id,
                     table_name=table,
                     approved=approved,
+                    before_column=before_col,
+                    after_column=after_col,
                 )
             )
     return result
+
+
+def sync_change_requests(control_path: Path) -> tuple[list[str], list[str]]:
+    """Append ChangeRequests folders that are missing from the sheet.
+
+    New rows are ``include=N`` and ``approved=N``. Existing rows are left as
+    they are. Returns ``(added ids, sheet ids with no folder)``.
+    """
+    control_path = Path(control_path)
+    control = read_control(control_path)
+    cr_root = control.working_root / "ChangeRequests"
+    folders = (
+        sorted(p.name for p in cr_root.iterdir() if p.is_dir()) if cr_root.is_dir() else []
+    )
+    folder_set = set(folders)
+    existing = [row.change_request_id for row in control.change_requests]
+    missing = [cr_id for cr_id in existing if cr_id not in folder_set]
+    added = [name for name in folders if name not in set(existing)]
+    if not added:
+        return [], missing
+
+    wb = load_workbook(control_path)
+    ws = wb["ChangeRequests"]
+    header = [cell.value for cell in next(ws.iter_rows(min_row=1, max_row=1))]
+    next_order = max((row.order for row in control.change_requests), default=0) + 1
+    for name in added:
+        values = {
+            "change_request_id": name,
+            "order": next_order,
+            "include": "N",
+            "approved": "N",
+            "description": "",
+            "notes": "",
+        }
+        ws.append(
+            [
+                values.get(str(h).strip().lower() if h else "", "")
+                for h in header
+            ]
+        )
+        next_order += 1
+    wb.save(control_path)
+    wb.close()
+    return added, missing
 
 
 def _header_index(header: tuple) -> dict[str, int]:

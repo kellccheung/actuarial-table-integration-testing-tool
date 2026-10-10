@@ -76,9 +76,3 @@ def values_equal(a: object, b: object) -> bool:
     except (TypeError, ValueError):
         return False
 
-
-def format_normalized_key(values: list | tuple | None) -> str:
-    """Pipe-join key parts after numeric normalization."""
-    if values is None:
-        return ""
-    return "|".join(normalize_key_part(v) for v in values)

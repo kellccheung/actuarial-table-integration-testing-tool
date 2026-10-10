@@ -5,16 +5,17 @@ from __future__ import annotations
 from pathlib import Path
 
 import polars as pl
+import pytest
 from openpyxl import Workbook, load_workbook
 
 from prophet_table_tool.changelog import generate_change_log
 from prophet_table_tool.changelog_review import (
+    ReviewWorkbookWriter,
     TableReviewModel,
     add_contribution,
     build_review_grid,
     group_table_reviews,
     review_group_for_table,
-    write_review_sheets,
 )
 from prophet_table_tool.control import ControlConfig
 from prophet_table_tool.diff import ChangeRow, detect_conflicts, diff_table
@@ -433,6 +434,32 @@ def test_cell_overlap_row_add_then_value_update_notes():
     assert "same new_value" not in overlap[0]["notes"]
 
 
+def test_cell_overlap_same_value_follow_on_names_both():
+    """Same new_value on a row_add then value_update still names the follow-on."""
+    rows = [
+        _cr(
+            "CR_A",
+            "row_add",
+            key_tuple="99|1|PROD_A",
+            column_name="Rate",
+            new_value="0.5",
+        ),
+        _cr(
+            "CR_B",
+            "value_update",
+            key_tuple="99|1|PROD_A",
+            column_name="Rate",
+            old_value="0.5",
+            new_value="0.5",
+        ),
+    ]
+    conflicts = detect_conflicts(rows)
+    overlap = [c for c in conflicts if c["conflict_type"] == "cell_overlap"]
+    assert len(overlap) == 1
+    assert "same new_value" in overlap[0]["notes"]
+    assert "row_add and value_update" in overlap[0]["notes"]
+
+
 def test_cell_overlap_column_add_then_value_update_notes():
     """Follow-on value_update on a newly added column is still overlap; notes mention sequence."""
     rows = [
@@ -669,7 +696,11 @@ def test_review_change_column_includes_cr_ids(tmp_path: Path):
     assert by_key["40"].source_crs == ["CR_X"]
 
     out = tmp_path / "review.xlsx"
-    write_review_sheets(out, reviews)
+    writer = ReviewWorkbookWriter(out)
+    try:
+        writer.write_table(reviews["T"])
+    finally:
+        writer.close()
     wb = load_workbook(out)
     change_cells = _change_cells_by_first_data_col(wb["T"])
     wb.close()
@@ -728,8 +759,22 @@ def test_review_change_column_joins_multiple_crs(tmp_path: Path):
         ],
     )
     out = tmp_path / "review.xlsx"
-    write_review_sheets(out, reviews)
+    writer = ReviewWorkbookWriter(out)
+    try:
+        writer.write_table(reviews["T"])
+    finally:
+        writer.close()
     wb = load_workbook(out)
     change_cells = _change_cells_by_first_data_col(wb["T"])
     wb.close()
     assert change_cells["20"] == "[CR_A] | [CR_B]"
+
+
+def test_short_data_row_raises(tmp_path: Path):
+    path = tmp_path / "T.csv"
+    path.write_text("!3,Age,Duration,Rate\n*,20,1\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="expected 4"):
+        read_prophet_csv(path)
+    path.write_text("!3,Age,Duration,Rate\n*,20,1,\n", encoding="utf-8")
+    table = read_prophet_csv(path)
+    assert table.data.rows() == [("20", "1", "")]

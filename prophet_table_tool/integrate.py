@@ -20,6 +20,8 @@ from .prophet_csv import (
     discover_csv_tables,
     key_str_expr,
     read_prophet_csv,
+    require_unique_keys,
+    with_normalized_keys,
     write_prophet_csv,
 )
 from .utils import file_hash, generate_run_id, yn_to_bool
@@ -90,6 +92,9 @@ def integrate_changes(
         logger.info("change_log_path=%s", change_log_path)
         logger.info("change_log_hash=%s", file_hash(change_log_path))
         logger.info("production_tables_path=%s", control.production_tables_path)
+
+        if mode == "apply" and staging_dir.exists():
+            shutil.rmtree(staging_dir)
 
         approved_crs = control.included_requests(require_approved=True)
         cr_order = {r.change_request_id: r.order for r in approved_crs}
@@ -165,7 +170,10 @@ def integrate_changes(
             tables: dict[str, ProphetTable] = {}
             path = prod_paths.get(table_name)
             if path is not None:
-                tables[table_name] = read_prophet_csv(path)
+                loaded = read_prophet_csv(path)
+                loaded.layout_columns = list(loaded.columns)
+                tables[table_name] = loaded
+                require_unique_keys(tables[table_name], f"Table '{table_name}' production")
 
             cr_rows = by_table_cr.get(table_name, {})
             for cr in approved_crs:
@@ -261,33 +269,18 @@ def integrate_changes(
             logger.info("[%s] applied %s", cr_id, table_name)
 
         out_dir = control.output_path / "New_Production_Tables"
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        written = 0
-        written_names: set[str] = set()
-        if staging_dir.is_dir():
-            for src in staging_dir.rglob("*"):
-                if not src.is_file():
-                    continue
-                rel = src.relative_to(staging_dir)
-                out_path = out_dir / rel
-                out_path.parent.mkdir(parents=True, exist_ok=True)
-                logger.info("publishing %s -> %s", rel.as_posix(), out_path)
-                shutil.copy2(src, out_path)
-                written += 1
-                written_names.add(rel.with_suffix("").as_posix())
-
-        for name in staged_names:
-            written_names.add(name)
-
+        staging_dir.mkdir(parents=True, exist_ok=True)
         for name, src in prod_paths.items():
-            if name in written_names:
+            if name in staged_names:
                 continue
-            out_path = out_dir / Path(name).with_suffix(src.suffix)
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            logger.info("copying unchanged %s -> %s", name, out_path)
-            shutil.copy2(src, out_path)
-            written += 1
+            dest = staging_dir / Path(name).with_suffix(src.suffix)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            logger.info("copying unchanged %s -> %s", name, dest)
+            shutil.copy2(src, dest)
+
+        written = sum(1 for p in staging_dir.rglob("*") if p.is_file())
+        logger.info("publishing %s -> %s", staging_dir, out_dir)
+        _publish_staging(staging_dir, out_dir)
 
         validation_messages.append(
             _vmsg("summary", "", "", "", "", "", f"Wrote {written} table(s) to {out_dir}", "INFO")
@@ -323,6 +316,25 @@ def _remove_stage2_dir(path: Path) -> None:
     """Delete a Stage 2 staging folder if it exists (apply spill / crash cleanup)."""
     if path.is_dir():
         shutil.rmtree(path, ignore_errors=True)
+
+
+def _publish_staging(staging_dir: Path, out_dir: Path) -> None:
+    """Replace *out_dir* with *staging_dir*. Put the old folder back if the swap fails."""
+    aside = out_dir.with_name(f".{out_dir.name}_old")
+    if aside.exists():
+        shutil.rmtree(aside)
+    moved = False
+    if out_dir.exists():
+        out_dir.rename(aside)
+        moved = True
+    try:
+        staging_dir.rename(out_dir)
+    except Exception:
+        if moved:
+            aside.rename(out_dir)
+        raise
+    if aside.exists():
+        shutil.rmtree(aside, ignore_errors=True)
 
 
 def _vmsg(
@@ -506,7 +518,7 @@ def _validate_table_changes(
         return ok, msgs
 
     table = tables[table_name]
-    existing = with_key_str(table).select("_key_str")
+    existing = with_normalized_keys(table.data, table.key_columns).select("_key_str")
 
     need_exist = [r for r in rows if r.change_type in {"value_update", "row_delete"}]
     if need_exist:
@@ -577,10 +589,6 @@ def _validate_table_changes(
     return ok, msgs
 
 
-def with_key_str(table: ProphetTable) -> pl.DataFrame:
-    return table.data.with_columns(key_str_expr(table.key_columns).alias("_key_str"))
-
-
 def _group_by_type(rows: list[ChangeRow]) -> dict[str, list[ChangeRow]]:
     grouped: dict[str, list[ChangeRow]] = defaultdict(list)
     for r in rows:
@@ -606,6 +614,46 @@ def _pivot_cells(rows: list[ChangeRow], value_attr: str) -> pl.DataFrame:
         values="value",
         aggregate_function="last",
     )
+
+
+_INSERT_AFTER = "insert_after="
+
+
+def _insert_after_anchor(notes: str) -> str | None:
+    """Column to insert after. ``None`` means an older Change Log with no anchor.
+
+    Empty string means the new column is first.
+    """
+    if notes.startswith(_INSERT_AFTER):
+        return notes[len(_INSERT_AFTER) :]
+    return None
+
+
+def _place_added_column(
+    columns: list[str],
+    col: str,
+    anchor: str | None,
+    *,
+    legacy_at: int | None,
+    layout: set[str],
+) -> None:
+    """Insert *col* into *columns*. ``legacy_at`` is the old boundary index."""
+    if anchor is None:
+        if legacy_at is None:
+            columns.append(col)
+        else:
+            columns.insert(min(legacy_at, len(columns)), col)
+        return
+    if anchor == "":
+        columns.insert(0, col)
+        return
+    if anchor not in columns:
+        columns.append(col)
+        return
+    idx = columns.index(anchor) + 1
+    while idx < len(columns) and columns[idx] not in layout:
+        idx += 1
+    columns.insert(idx, col)
 
 
 def _list_get(parts: pl.Expr, i: int) -> pl.Expr:
@@ -666,7 +714,34 @@ def _apply_table_changes(
             data = wide.select(col_order).cast(pl.Utf8).fill_null("")
         else:
             data = pl.DataFrame({c: [] for c in col_order}).cast(pl.Utf8)
-        return ProphetTable(n_keys=n_keys, columns=col_order, data=data)
+        source_path = None
+        leading: list[bytes] = []
+        trailing: list[bytes] = []
+        newline = b"\n"
+        cr = next(
+            (row for row in control.change_requests if row.change_request_id == cr_id),
+            None,
+        )
+        if cr is not None:
+            _before_tables, after_tables, _production = control.discover_cr_tables(cr)
+            src = after_tables.get(table_name)
+            if src is not None:
+                # shortcut: banner and suffix come from the after file at apply time, not the Change Log
+                src_table = read_prophet_csv(src)
+                source_path = src
+                leading = list(src_table.leading_dummy_lines)
+                trailing = list(src_table.trailing_dummy_lines)
+                newline = src_table.newline
+        return ProphetTable(
+            n_keys=n_keys,
+            columns=col_order,
+            data=data,
+            source_path=source_path,
+            leading_dummy_lines=leading,
+            trailing_dummy_lines=trailing,
+            newline=newline,
+            layout_columns=list(col_order),
+        )
 
     table = tables[table_name]
     original_n_keys = table.n_keys
@@ -676,6 +751,8 @@ def _apply_table_changes(
     leading_dummy_lines = list(table.leading_dummy_lines)
     trailing_dummy_lines = list(table.trailing_dummy_lines)
     source_path = table.source_path
+    newline = table.newline
+    layout = list(table.layout_columns) if table.layout_columns is not None else list(columns)
 
     for r in by_type.get("key_count_change", []):
         if r.n_keys_after is not None:
@@ -685,27 +762,73 @@ def _apply_table_changes(
         old_c, new_c = r.old_value, r.new_value
         if old_c in columns:
             columns = [new_c if c == old_c else c for c in columns]
+            layout = [new_c if c == old_c else c for c in layout]
             data = data.rename({old_c: new_c})
 
+    renamed_key_cols = list(columns[: max(original_n_keys - 1, 0)])
+    layout_set = set(layout)
+    legacy_adds: list[ChangeRow] = []
+    anchored_adds: list[ChangeRow] = []
     for r in by_type.get("column_add", []):
+        if not r.column_name or r.column_name in columns:
+            continue
+        if _insert_after_anchor(r.notes) is None:
+            legacy_adds.append(r)
+        else:
+            anchored_adds.append(r)
+
+    def _add_blank(col: str) -> None:
+        nonlocal data
+        data = data.with_columns(pl.lit("").cast(pl.Utf8).alias(col))
+        data = data.select(columns)
+
+    for r in legacy_adds:
         col = r.column_name
-        if col and col not in columns:
-            if n_keys > original_n_keys:
-                insert_at = max(original_n_keys - 1, 0)
-                insert_at = min(insert_at, len(columns))
-                columns.insert(insert_at, col)
-            else:
-                columns.append(col)
-            data = data.with_columns(pl.lit("").cast(pl.Utf8).alias(col))
-            data = data.select(columns)
+        if n_keys > original_n_keys:
+            insert_at = min(max(original_n_keys - 1, 0), len(columns))
+            columns.insert(insert_at, col)
+        else:
+            columns.append(col)
+        _add_blank(col)
+
+    guard = len(anchored_adds) + 1
+    while anchored_adds and guard:
+        guard -= 1
+        still: list[ChangeRow] = []
+        moved = False
+        for r in anchored_adds:
+            col = r.column_name
+            if col in columns:
+                continue
+            anchor = _insert_after_anchor(r.notes)
+            if (
+                anchor
+                and anchor not in columns
+                and any(other.column_name == anchor for other in anchored_adds)
+            ):
+                still.append(r)
+                continue
+            _place_added_column(columns, col, anchor, legacy_at=None, layout=layout_set)
+            _add_blank(col)
+            moved = True
+        anchored_adds = still
+        if not moved:
+            break
+    for r in anchored_adds:
+        col = r.column_name
+        if col in columns:
+            continue
+        columns.append(col)
+        _add_blank(col)
 
     for r in by_type.get("column_delete", []):
         col = r.column_name
         if col in columns:
             columns = [c for c in columns if c != col]
+            layout = [c for c in layout if c != col]
             data = data.drop(col)
 
-    match_key_cols = columns[: max(original_n_keys - 1, 0)]
+    match_key_cols = [c for c in renamed_key_cols if c in columns]
     final_key_cols = columns[: max(n_keys - 1, 0)]
     data = data.with_columns(key_str_expr(match_key_cols).alias("_key_str"))
 
@@ -769,6 +892,8 @@ def _apply_table_changes(
         source_path=source_path,
         leading_dummy_lines=leading_dummy_lines,
         trailing_dummy_lines=trailing_dummy_lines,
+        newline=newline,
+        layout_columns=layout,
     )
 
 

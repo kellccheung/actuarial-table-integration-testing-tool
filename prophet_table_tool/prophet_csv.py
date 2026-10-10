@@ -34,16 +34,15 @@ class ProphetTable:
     leading_dummy_lines: list[bytes] = field(default_factory=list)
     trailing_dummy_lines: list[bytes] = field(default_factory=list)
     source_encoding: str | None = None
+    newline: bytes = b"\n"
+    # Production column names. Later column adds must not insert in front of
+    # columns an earlier change request already appended.
+    layout_columns: list[str] | None = None
 
     @property
     def key_columns(self) -> list[str]:
         """Key columns among the data headers (first n_keys - 1)."""
         return self.columns[: self.n_keys - 1]
-
-    @property
-    def value_columns(self) -> list[str]:
-        """Non-key data columns."""
-        return self.columns[self.n_keys - 1 :]
 
     @property
     def source_suffix(self) -> str:
@@ -82,6 +81,66 @@ def key_str_expr(key_cols: list[str]) -> pl.Expr:
 def with_normalized_keys(df: pl.DataFrame, key_cols: list[str]) -> pl.DataFrame:
     """Add ``_key_str`` (pipe-joined) with numeric key normalization."""
     return df.with_columns(key_str_expr(key_cols).alias("_key_str"))
+
+
+def require_unique_keys(table: ProphetTable, label: str) -> None:
+    """Raise when two data rows share one normalized key."""
+    if table.data.height < 2:
+        return
+    dup = (
+        table.data.select(key_str_expr(table.key_columns).alias("_key_str"))
+        .group_by("_key_str")
+        .len()
+        .filter(pl.col("len") > 1)
+    )
+    if dup.height:
+        sample = dup.get_column("_key_str")[0]
+        raise ValueError(f"{label}: duplicate key {sample!r}")
+
+
+def read_prophet_header(path: Path) -> tuple[int, list[str]]:
+    """Return ``(n_keys, column names)`` from the first ``!N`` line.
+
+    Dummy lines before that marker are skipped. Data rows are not read.
+    """
+    path = Path(path)
+    if not path.is_file():
+        raise ValueError(f"Table file not found: {path}")
+    header_line: bytes | None = None
+    with path.open("rb") as fh:
+        first = fh.read(len(_UTF8_BOM))
+        if first != _UTF8_BOM:
+            fh.seek(0)
+        for raw in fh:
+            line = raw.strip()
+            if not line:
+                continue
+            if _HEADER_MARKER_RE.match(_first_field_bytes(line)):
+                header_line = line
+                break
+    if header_line is None:
+        raise ValueError(
+            f"Invalid Prophet table in {path}: no !N header row found "
+            f"(content must start with a !N marker row)"
+        )
+    text, _encoding = _decode_with_fallback(header_line, path)
+    return _parse_header_cells(_split_csv_line(text), path)
+
+
+def _parse_header_cells(header_cells: list[str], path: Path) -> tuple[int, list[str]]:
+    try:
+        n_keys = int(header_cells[0][1:])
+    except (ValueError, IndexError) as exc:
+        marker = header_cells[0] if header_cells else ""
+        raise ValueError(f"Invalid key-count marker in {path}: {marker!r}") from exc
+    columns = header_cells[1:]
+    if n_keys < 1:
+        raise ValueError(f"n_keys must be >= 1 in {path}, got {n_keys}")
+    if n_keys - 1 > len(columns):
+        raise ValueError(
+            f"n_keys={n_keys} exceeds available columns ({len(columns)}) in {path}"
+        )
+    return n_keys, columns
 
 
 def read_prophet_csv(path: Path) -> ProphetTable:
@@ -140,22 +199,17 @@ def read_prophet_csv(path: Path) -> ProphetTable:
     header_text = decoded[0] if decoded else ""
     data_text_lines = decoded[1:] if data_line_bytes else []
 
-    header_cells = _split_csv_line(header_text)
-    try:
-        n_keys = int(header_cells[0][1:])
-    except (ValueError, IndexError) as exc:
-        marker = header_cells[0] if header_cells else ""
-        raise ValueError(f"Invalid key-count marker in {path}: {marker!r}") from exc
-
-    columns = header_cells[1:]
-    if n_keys < 1:
-        raise ValueError(f"n_keys must be >= 1 in {path}, got {n_keys}")
-    if n_keys - 1 > len(columns):
-        raise ValueError(
-            f"n_keys={n_keys} exceeds available columns ({len(columns)}) in {path}"
-        )
+    n_keys, columns = _parse_header_cells(_split_csv_line(header_text), path)
+    expected = 1 + len(columns)
+    for line in data_text_lines:
+        n_fields = len(_split_csv_line(line))
+        if n_fields != expected:
+            raise ValueError(
+                f"{path}: data row has {n_fields} fields, expected {expected}: {line[:80]}"
+            )
 
     data = _read_data_block(columns, data_text_lines)
+    newline = b"\r\n" if b"\r\n" in raw_bytes else b"\n"
 
     return ProphetTable(
         n_keys=n_keys,
@@ -165,6 +219,7 @@ def read_prophet_csv(path: Path) -> ProphetTable:
         leading_dummy_lines=leading_dummy_lines,
         trailing_dummy_lines=trailing_dummy_lines,
         source_encoding=encoding,
+        newline=newline,
     )
 
 
@@ -173,14 +228,15 @@ def write_prophet_csv(table: ProphetTable, path: Path) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
+    nl = table.newline or b"\n"
     chunks: list[bytes] = []
     for line in table.leading_dummy_lines:
         chunks.append(line)
-        chunks.append(b"\n")
+        chunks.append(nl)
 
     header = ",".join([f"!{table.n_keys}", *table.columns])
     chunks.append(header.encode("utf-8"))
-    chunks.append(b"\n")
+    chunks.append(nl)
 
     if table.data.height:
         starred = table.data.select(table.columns).with_columns(
@@ -195,13 +251,15 @@ def write_prophet_csv(table: ProphetTable, path: Path) -> None:
         )
         body = buf.getvalue()
         if body:
+            if nl == b"\r\n":
+                body = body.replace(b"\n", b"\r\n")
             chunks.append(body)
-            if not body.endswith(b"\n"):
-                chunks.append(b"\n")
+            if not body.endswith(nl):
+                chunks.append(nl)
 
     for line in table.trailing_dummy_lines:
         chunks.append(line)
-        chunks.append(b"\n")
+        chunks.append(nl)
 
     path.write_bytes(b"".join(chunks))
 

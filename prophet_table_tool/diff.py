@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 import polars as pl
 
 from .control import ControlConfig
-from .prophet_csv import ProphetTable, with_normalized_keys
+from .prophet_csv import ProphetTable, require_unique_keys, with_normalized_keys
 from .utils import values_equal
 
 
@@ -155,6 +155,56 @@ def _cells_differ_expr(old_col: str, new_col: str) -> pl.Expr:
     return ~(string_eq | numeric_eq)
 
 
+def _match_pairs(
+    change_request_id: str,
+    table_name: str,
+    before: ProphetTable,
+    after: ProphetTable,
+    control: ControlConfig,
+    rename_old_to_new: dict[str, str],
+    rename_notes: dict[str, str],
+) -> list[tuple[str, str]]:
+    """Both-filled KeyCountApprovals pairs, in before-column order.
+
+    A pair whose names differ is a key rename and wins over ColumnRenames.
+    One-sided pairs are excluded from the match.
+    """
+    pairs = control.key_column_pairs(change_request_id, table_name)
+    if not pairs:
+        return []
+    both = [(before_col, after_col) for before_col, after_col in pairs if before_col and after_col]
+    if not both:
+        raise ValueError(
+            f"[{change_request_id}] Table '{table_name}' KeyCountApprovals rows "
+            "need a before_column and after_column pair to match rows."
+        )
+    order = {name: i for i, name in enumerate(before.columns)}
+    missing_before = [before_col for before_col, _after_col in both if before_col not in order]
+    missing_after = [after_col for _before_col, after_col in both if after_col not in after.columns]
+    if missing_before or missing_after:
+        raise ValueError(
+            f"[{change_request_id}] Table '{table_name}' KeyCountApprovals "
+            f"column(s) {missing_before + missing_after} are not on that side of the table."
+        )
+    if len({before_col for before_col, _after_col in both}) != len(both):
+        raise ValueError(
+            f"[{change_request_id}] Table '{table_name}' KeyCountApprovals "
+            "repeats a before_column."
+        )
+    if len({after_col for _before_col, after_col in both}) != len(both):
+        raise ValueError(
+            f"[{change_request_id}] Table '{table_name}' KeyCountApprovals "
+            "repeats an after_column."
+        )
+    both.sort(key=lambda pair: order[pair[0]])
+    for before_col, after_col in both:
+        if before_col == after_col:
+            continue
+        rename_old_to_new[before_col] = after_col
+        rename_notes[before_col] = "Declared in KeyCountApprovals"
+    return both
+
+
 def diff_table(
     change_request_id: str,
     table_name: str,
@@ -172,6 +222,11 @@ def diff_table(
 
     if before is None and after is None:
         return result
+
+    if before is not None:
+        require_unique_keys(before, f"[{change_request_id}] Table '{table_name}' before")
+    if after is not None:
+        require_unique_keys(after, f"[{change_request_id}] Table '{table_name}' after")
 
     if before is None and after is not None:
         result.tables_touched.add(table_name)
@@ -230,6 +285,10 @@ def diff_table(
 
     declared = control.renames_for(change_request_id, table_name)
     rename_old_to_new = {r.old_column_name: r.new_column_name for r in declared}
+    rename_notes = {old: "Declared in ColumnRenames" for old in rename_old_to_new}
+    match_pairs = _match_pairs(
+        change_request_id, table_name, before, after, control, rename_old_to_new, rename_notes
+    )
     rename_new_to_old = {v: k for k, v in rename_old_to_new.items()}
 
     for old_c, new_c in rename_old_to_new.items():
@@ -244,7 +303,7 @@ def diff_table(
                 column_name=f"{old_c}->{new_c}",
                 old_value=old_c,
                 new_value=new_c,
-                notes="Declared in ColumnRenames",
+                notes=rename_notes.get(old_c, ""),
             )
         )
 
@@ -253,9 +312,10 @@ def diff_table(
     before_set = set(before_cols_mapped)
     after_set = set(after_cols)
 
-    for col in sorted(after_set - before_set):
-        if col in rename_new_to_old:
+    for i, col in enumerate(after_cols):
+        if col in before_set or col in rename_new_to_old:
             continue
+        prev = after_cols[i - 1] if i else ""
         result.structural_rows.append(
             ChangeRow(
                 change_request_id=change_request_id,
@@ -267,7 +327,7 @@ def diff_table(
                 column_name=col,
                 old_value="",
                 new_value="",
-                notes="",
+                notes=f"insert_after={prev}",
             )
         )
 
@@ -298,12 +358,26 @@ def diff_table(
             {old: new for old, new in rename_old_to_new.items() if old in before_aligned.columns}
         )
 
-    if before.n_keys == after.n_keys:
-        key_cols = after.key_columns
+    if match_pairs:
+        key_cols = [after_col for _before_col, after_col in match_pairs]
+    elif before.n_keys == after.n_keys:
+        key_cols = list(after.key_columns)
+        missing = [col for col in key_cols if col not in before_aligned.columns]
+        if missing:
+            raise ValueError(
+                f"[{change_request_id}] Table '{table_name}' key column(s) {missing} "
+                "differ between before and after. Declare before_column and "
+                "after_column on KeyCountApprovals."
+            )
     else:
-        key_cols = [c for c in after.key_columns if c in before_aligned.columns]
+        before_keys = [rename_old_to_new.get(c, c) for c in before.key_columns]
+        key_cols = [col for col in before_keys if col in after.columns]
         if not key_cols:
-            return result
+            raise ValueError(
+                f"[{change_request_id}] Table '{table_name}' has no shared key column "
+                f"({before.n_keys} -> {after.n_keys}). Declare before_column and "
+                "after_column on KeyCountApprovals."
+            )
 
     common_value_cols = [
         c for c in after.columns if c in before_aligned.columns and c not in key_cols
@@ -539,21 +613,22 @@ def _detect_conflicts(
                     col_add_crs = column_add_index.get((table, column), set())
                     sequenced_col = bool(col_add_crs & cr_ids) and "value_update" in types
                     sequenced_row = "row_add" in types and "value_update" in types
+                    kinds: list[str] = []
+                    if sequenced_row:
+                        kinds.append("row_add and value_update")
+                    if sequenced_col:
+                        kinds.append("column_add and value_update")
+                    kind_note = f" ({' / '.join(kinds)})" if kinds else ""
                     if same_new_value:
                         notes = (
                             "Multiple change requests modify the same cell with the same "
-                            "new_value; set resolved=Y to accept both writes"
+                            f"new_value{kind_note}; set resolved=Y to accept both writes"
                         )
-                    elif sequenced_row or sequenced_col:
-                        kinds: list[str] = []
-                        if sequenced_row:
-                            kinds.append("row_add and value_update")
-                        if sequenced_col:
-                            kinds.append("column_add and value_update")
+                    elif kinds:
                         notes = (
-                            "Multiple change requests modify the same cell ("
-                            + " / ".join(kinds)
-                            + "); set resolved=Y to apply both in Control order"
+                            "Multiple change requests modify the same cell"
+                            + kind_note
+                            + "; set resolved=Y to apply both in Control order"
                         )
                     else:
                         notes = (

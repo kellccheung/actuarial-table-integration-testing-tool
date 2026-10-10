@@ -84,15 +84,19 @@ WorkingRoot/
 | Key                        | Example / Value                          | Description |
 |---------------------------|------------------------------------------|-----------|
 | `working_root`            | `D:\ProphetChanges\2026Q3`              | Root path |
-| `mode`                    | `generate_changelog` / `validate_only` / `apply` | Run mode |
+| `mode`                    | `generate_changelog` / `scan` / `sync_requests` / `validate_only` / `apply` | Run mode |
 | `production_tables_path`  | `Production_Tables`                     | Relative or absolute |
 | `output_path`             | `Output`                                | |
 | `run_id`                  | (auto-generated)                        | |
 
 ### Sheet: `ChangeRequests`
-| change_request_id                  | order | include | approved | description                  | notes |
-|------------------------------------|-------|---------|----------|------------------------------|-------|
-| CR_2026Q3_01_MortalityUpdate      | 1     | Y       | Y        | Mortality assumption update |       |
+| change_request_id                  | order | include | approved | description                  | notes | after_path | before_source | before_path |
+|------------------------------------|-------|---------|----------|------------------------------|-------|------------|---------------|-------------|
+| CR_2026Q3_01_MortalityUpdate      | 1     | Y       | Y        | Mortality assumption update |       |            | folder        |             |
+
+`after_path`, `before_source` (`folder` or `production`), and `before_path` are optional. Blank keeps `ChangeRequests/<id>/before` and `.../after`. `production` uses the same relative path under `production_tables_path` and does not treat other production tables as deletes.
+
+`sync_requests` appends a row (`include=N`, `approved=N`) for each new folder under `ChangeRequests/`. Existing rows are unchanged.
 | CR_2026Q3_02_ExpenseRevision      | 2     | Y       | Y        | Expense loading revision    |       |
 
 - `order`: integer – determines application sequence in Stage 2.
@@ -107,9 +111,12 @@ WorkingRoot/
 Column renames are **never** auto-detected. They must be declared here.
 
 ### Sheet: `KeyCountApprovals` (optional helper)
-| change_request_id             | table_name   | approved |
-|-------------------------------|--------------|----------|
-| CR_2026Q3_03_StructureChange  | EXPENSE_TABLE| Y        |
+| change_request_id             | table_name   | approved | before_column | after_column |
+|-------------------------------|--------------|----------|---------------|--------------|
+| CR_2026Q3_03_StructureChange  | EXPENSE_TABLE| Y        |               |              |
+| CR_2026Q3_04_KeyRename        | MORT_TABLE   | Y        | Duration      | Term         |
+
+`before_column` / `after_column` are optional. Filled pairs are the row match (list every match column, including unchanged names, in before-key order). A different pair of names is a key rename. One-sided names record a column that joined or left the key and are not used to pair rows. Stage 2 approves the table only when every row for that request and table is `Y`.
 
 ---
 
@@ -125,14 +132,16 @@ def generate_change_log(control_path: Path) -> Path:
 
 **Logic:**
 1. Read `Control.xlsx` → list of included change requests sorted by `order`.
-2. For each change request folder:
+2. Scan each table's `!N` header and write `Output/StructureScan_<run_id>.xlsx`. Fatal findings stop the run. `mode=scan` writes that report and does not diff cells.
+3. For each change request, one at a time:
    - Discover all CSV/FAC files in `before/` and `after/` **recursively**.
      Table identity is the posix relative path without suffix (e.g. `SubA/MORT_TABLE`).
    - Tables present in both → compute detailed diff (numeric-aware value compare).
    - Tables only in `after/` → record as full table add (`table_add`).
    - Tables only in `before/` → raise warning, record in Summary, **do not** generate any change rows for that table.
-3. Detect conflicts across change requests (same table + same key combination + same column, structural collision, or missing row×column fill).
-4. Write Change Log Excel (Summary / Conflicts / ReviewFiles index) plus `ChangeLog_*_Detail.csv` sidecar and per-folder review workbooks under `ChangeLog_*_reviews/`.
+   - Write that request's cell rows and changed-key review slices to `Output/.stage1_<run_id>/`, then drop the table frames.
+4. After every request: per table, detect conflicts and write the review sheet from the spilled files, then stream `ChangeLog_*_Detail.csv`. The staging folder is deleted at the end.
+5. Write Change Log Excel (Summary / Conflicts / ReviewFiles index) plus the Detail CSV and per-folder review workbooks under `ChangeLog_*_reviews/`.
 
 **Change Log outputs:**
 
@@ -217,8 +226,7 @@ def integrate_changes(
 
 ## 7. Audit Trail
 
-Every run writes a `.log` file containing:
-- Timestamp (ISO format)
+Every run writes a `.log` file. Each line starts with a local timestamp (`YYYY-MM-DDTHH:MM:SS±HHMM`). The log also contains:
 - Run mode
 - Control file hash
 - Change Log hash
@@ -233,7 +241,6 @@ The Integration Report (not the `.log`) is where cell-overlap last-writer detail
 
 ## 8. Error Handling & Safety Rules
 
-- Exact string match only (no tolerance).
 - Tables only in `before` → warning + skip (never delete automatically).
 - Unresolved conflicts → hard stop in `apply` mode.
 - `row_add` when the key already exists in the current (sequential) table → hard stop.
@@ -245,23 +252,12 @@ The Integration Report (not the `.log`) is where cell-overlap last-writer detail
 
 ---
 
-## 9. Recommended Implementation Notes
-
-- Use **Polars** for all table reading, joining, and diffing.
-- Parse the special first row carefully; never treat the `!N` or `*` rows as normal data.
-- Represent keys as a tuple (or struct) of the first `N` columns for reliable matching.
-- Keep all intermediate results as Polars DataFrames until final Excel writing.
-- Use `openpyxl` for reading Control / writing the slim Change Log index and Integration Report; use `xlsxwriter` for per-folder review workbooks.
-- Generate `run_id` as `YYYYMMDD_HHMMSS`.
-
----
-
-## 10. Developer Checklist & Acceptance Test Cases
+## 9. Developer Checklist & Acceptance Test Cases
 
 ### Developer Checklist (Must Pass Before Handover)
 
 - [ ] Correctly parses Prophet CSV format (`!N` on first row, `*` on data rows). `N` includes the marker column.
-- [ ] Key matching uses the first `N` columns as a composite key (exact string match only).
+- [ ] Key matching uses the first `N` columns as a composite key.
 - [ ] Stage 1 correctly handles:
   - Value updates
   - Row add / delete

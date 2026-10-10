@@ -206,42 +206,36 @@ def build_review_grid(model: TableReviewModel) -> ReviewGrid | None:
     )
 
 
-def write_review_workbook(
-    path: Path,
-    reviews: dict[str, TableReviewModel],
-    *,
-    conflict_headers: list[str] | None = None,
-    conflict_rows: list[list] | None = None,
-) -> None:
-    """Write Conflicts (optional) plus one review sheet per table via xlsxwriter."""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    wb = xlsxwriter.Workbook(str(path), {"constant_memory": True})
-    try:
-        formats = _make_formats(wb)
-        used_names: set[str] = set(RESERVED_SHEET_NAMES)
+class ReviewWorkbookWriter:
+    """One open review workbook. Write the conflicts sheet, then one table at a time."""
+
+    def __init__(
+        self,
+        path: Path,
+        conflict_headers: list[str] | None = None,
+        conflict_rows: list[list] | None = None,
+    ) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.wb = xlsxwriter.Workbook(str(self.path), {"constant_memory": True})
+        self.formats = _make_formats(self.wb)
+        self.used_names: set[str] = set(RESERVED_SHEET_NAMES)
         if conflict_headers is not None:
             _write_conflicts_sheet(
-                wb, formats, conflict_headers, conflict_rows or []
+                self.wb, self.formats, conflict_headers, conflict_rows or []
             )
-        for table_name in sorted(reviews):
-            grid = build_review_grid(reviews[table_name])
-            if grid is None:
-                continue
-            sheet_name = _unique_sheet_name(table_name, used_names)
-            used_names.add(sheet_name)
-            ws = wb.add_worksheet(sheet_name)
-            _write_review_sheet(ws, grid, formats)
-    finally:
-        wb.close()
 
+    def write_table(self, model: TableReviewModel) -> None:
+        grid = build_review_grid(model)
+        if grid is None:
+            return
+        sheet_name = _unique_sheet_name(model.table_name, self.used_names)
+        self.used_names.add(sheet_name)
+        ws = self.wb.add_worksheet(sheet_name)
+        _write_review_sheet(ws, grid, self.formats)
 
-def write_review_sheets(
-    path: Path,
-    reviews: dict[str, TableReviewModel],
-) -> None:
-    """Write per-table review sheets to a standalone workbook (no Conflicts tab)."""
-    write_review_workbook(path, reviews)
+    def close(self) -> None:
+        self.wb.close()
 
 
 def _make_formats(wb: xlsxwriter.Workbook) -> _ReviewFormats:

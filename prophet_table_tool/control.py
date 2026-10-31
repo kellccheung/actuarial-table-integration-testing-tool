@@ -322,50 +322,6 @@ def _read_key_count_approvals(wb) -> list[KeyCountApproval]:
     return result
 
 
-def sync_change_requests(control_path: Path) -> tuple[list[str], list[str]]:
-    """Append ChangeRequests folders that are missing from the sheet.
-
-    New rows are ``include=N`` and ``approved=N``. Existing rows are left as
-    they are. Returns ``(added ids, sheet ids with no folder)``.
-    """
-    control_path = Path(control_path)
-    control = read_control(control_path)
-    cr_root = control.working_root / "ChangeRequests"
-    folders = (
-        sorted(p.name for p in cr_root.iterdir() if p.is_dir()) if cr_root.is_dir() else []
-    )
-    folder_set = set(folders)
-    existing = [row.change_request_id for row in control.change_requests]
-    missing = [cr_id for cr_id in existing if cr_id not in folder_set]
-    added = [name for name in folders if name not in set(existing)]
-    if not added:
-        return [], missing
-
-    wb = load_workbook(control_path)
-    ws = wb["ChangeRequests"]
-    header = [cell.value for cell in next(ws.iter_rows(min_row=1, max_row=1))]
-    next_order = max((row.order for row in control.change_requests), default=0) + 1
-    for name in added:
-        values = {
-            "change_request_id": name,
-            "order": next_order,
-            "include": "N",
-            "approved": "N",
-            "description": "",
-            "notes": "",
-        }
-        ws.append(
-            [
-                values.get(str(h).strip().lower() if h else "", "")
-                for h in header
-            ]
-        )
-        next_order += 1
-    wb.save(control_path)
-    wb.close()
-    return added, missing
-
-
 def _header_index(header: tuple) -> dict[str, int]:
     return {
         str(h).strip().lower(): i

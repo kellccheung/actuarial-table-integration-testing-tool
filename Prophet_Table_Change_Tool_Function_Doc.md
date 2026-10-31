@@ -84,7 +84,7 @@ WorkingRoot/
 | Key                        | Example / Value                          | Description |
 |---------------------------|------------------------------------------|-----------|
 | `working_root`            | `D:\ProphetChanges\2026Q3`              | Root path |
-| `mode`                    | `generate_changelog` / `scan` / `sync_requests` / `validate_only` / `apply` | Run mode |
+| `mode`                    | `generate_changelog` / `scan` / `validate_only` / `apply` | Run mode |
 | `production_tables_path`  | `Production_Tables`                     | Relative or absolute |
 | `output_path`             | `Output`                                | |
 | `run_id`                  | (auto-generated)                        | |
@@ -93,11 +93,9 @@ WorkingRoot/
 | change_request_id                  | order | include | approved | description                  | notes | after_path | before_source | before_path |
 |------------------------------------|-------|---------|----------|------------------------------|-------|------------|---------------|-------------|
 | CR_2026Q3_01_MortalityUpdate      | 1     | Y       | Y        | Mortality assumption update |       |            | folder        |             |
+| CR_2026Q3_02_ExpenseRevision      | 2     | Y       | Y        | Expense loading revision    |       |            |               |             |
 
 `after_path`, `before_source` (`folder` or `production`), and `before_path` are optional. Blank keeps `ChangeRequests/<id>/before` and `.../after`. `production` uses the same relative path under `production_tables_path` and does not treat other production tables as deletes.
-
-`sync_requests` appends a row (`include=N`, `approved=N`) for each new folder under `ChangeRequests/`. Existing rows are unchanged.
-| CR_2026Q3_02_ExpenseRevision      | 2     | Y       | Y        | Expense loading revision    |       |
 
 - `order`: integer – determines application sequence in Stage 2.
 - `include`: `Y` / `N`

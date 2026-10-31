@@ -1,4 +1,4 @@
-"""Sync, external paths, key-column pairs, structure scan, and spilled change logs."""
+"""External paths, key-column pairs, structure scan, and spilled change logs."""
 
 from __future__ import annotations
 
@@ -13,7 +13,6 @@ from prophet_table_tool.control import (
     ControlConfig,
     KeyCountApproval,
     read_control,
-    sync_change_requests,
 )
 from prophet_table_tool.diff import diff_table
 from prophet_table_tool.prophet_csv import read_prophet_csv, read_prophet_header
@@ -81,33 +80,6 @@ def test_read_prophet_header_ignores_body(tmp_path: Path):
     n_keys, columns = read_prophet_header(path)
     assert n_keys == 2
     assert columns == ["Age", "Rate"]
-
-
-def test_sync_appends_folder_and_keeps_existing_row(tmp_path: Path):
-    (tmp_path / "ChangeRequests" / "CR_KEEP").mkdir(parents=True)
-    (tmp_path / "ChangeRequests" / "CR_NEW").mkdir(parents=True)
-    control_path = tmp_path / "Control.xlsx"
-    _write_control(
-        control_path,
-        working_root=tmp_path,
-        change_requests=[
-            ("CR_KEEP", 3, "Y", "Y", "keep me", ""),
-            ("CR_GONE", 1, "Y", "N", "missing folder", ""),
-        ],
-    )
-    added, missing = sync_change_requests(control_path)
-    assert added == ["CR_NEW"]
-    assert missing == ["CR_GONE"]
-
-    control = read_control(control_path)
-    by_id = {row.change_request_id: row for row in control.change_requests}
-    assert by_id["CR_KEEP"].order == 3
-    assert by_id["CR_KEEP"].include is True
-    assert by_id["CR_KEEP"].description == "keep me"
-    assert by_id["CR_NEW"].include is False
-    assert by_id["CR_NEW"].approved is False
-    assert by_id["CR_NEW"].order == 4
-    assert by_id["CR_GONE"].change_request_id == "CR_GONE"
 
 
 def test_key_approval_requires_every_row():

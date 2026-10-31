@@ -9,7 +9,7 @@ from pathlib import Path
 from openpyxl import load_workbook
 
 from .changelog import StructureScanError, generate_change_log, run_structure_scan
-from .control import ControlConfig, read_control, sync_change_requests
+from .control import ControlConfig, read_control
 from .integrate import integrate_changes
 
 
@@ -87,7 +87,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--mode",
-        choices=["generate_changelog", "validate_only", "apply", "scan", "sync_requests"],
+        choices=["generate_changelog", "validate_only", "apply", "scan"],
         default=None,
         help="Override mode from Control.xlsx Config sheet",
     )
@@ -96,18 +96,6 @@ def main(argv: list[str] | None = None) -> int:
     control = read_control(args.control)
     mode = args.mode or control.mode
     print(f"Mode: {mode}")
-
-    if mode == "sync_requests":
-        added, missing = sync_change_requests(args.control)
-        if added:
-            print("Added change request(s) with include=N:")
-            for cr_id in added:
-                print(f"  {cr_id}")
-        else:
-            print("No new change request folders to add.")
-        for cr_id in missing:
-            print(f"Warning: {cr_id} is on the sheet but has no folder.")
-        return 0
 
     if mode == "scan":
         scan_path, findings = run_structure_scan(control)

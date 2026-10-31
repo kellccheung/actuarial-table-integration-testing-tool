@@ -118,7 +118,7 @@ Example: `!4` means keys are the marker + the next 3 columns (`Age`, `Duration`,
 | Key | Example | Description |
 |-----|---------|-------------|
 | `working_root` | `D:\ProphetChanges\2026Q3` | Root folder. Leave blank to use the folder that contains `Control.xlsx`. |
-| `mode` | `generate_changelog` / `scan` / `sync_requests` / `validate_only` / `apply` | Default run mode (can be overridden on the CLI) |
+| `mode` | `generate_changelog` / `scan` / `validate_only` / `apply` | Default run mode (can be overridden on the CLI) |
 | `production_tables_path` | `Production_Tables` | Relative to working root, or absolute |
 | `output_path` | `Output` | Relative to working root, or absolute |
 | `run_id` | (optional) | If blank, auto-generated as `YYYYMMDD_HHMMSS` |
@@ -138,8 +138,6 @@ Example: `!4` means keys are the marker + the next 3 columns (`Age`, `Duration`,
 | `before_path` | Optional. Used when `before_source` is `folder`. Blank uses `ChangeRequests/<id>/before` |
 
 `before_source=production` compares each table under `after` with the same relative path in `production_tables_path`. A missing production file is a new table. Other production tables are left alone.
-
-`sync_requests` adds a sheet row for each new folder under `ChangeRequests/`, with `include=N` and `approved=N`. Rows already on the sheet are not changed. Set `include=Y` before a run.
 
 ### `ColumnRenames` (optional)
 

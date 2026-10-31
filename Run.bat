@@ -9,7 +9,6 @@ echo.
 echo Set "mode" in Control.xlsx Config sheet, then provide Control.xlsx below.
 echo   generate_changelog  - Stage 1: create Change Log
 echo   scan                - Stage 1: check table headers only
-echo   sync_requests       - add new ChangeRequests folders to Control.xlsx
 echo   validate_only       - Stage 2: dry-run validation
 echo   apply               - Stage 2: write New_Production_Tables
 echo.

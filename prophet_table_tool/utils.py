@@ -38,17 +38,30 @@ def yn_to_bool(value: object) -> bool:
     return str(value).strip().upper() in {"Y", "YES", "TRUE", "1"}
 
 
+def unwrap_wrapping_quotes(value: str) -> str:
+    """Drop one pair of double quotes that wraps the whole field.
+
+    Spaces outside that pair are dropped with it. Unquoted text is unchanged.
+    shortcut: one wrapping pair only; upgrade if a field holds a comma or an escaped quote.
+    """
+    trimmed = value.strip()
+    if len(trimmed) >= 2 and trimmed.startswith('"') and trimmed.endswith('"'):
+        return trimmed[1:-1]
+    return value
+
+
 def normalize_key_part(value: object) -> str:
     """
     Canonicalize one key cell for matching.
 
-    Numeric-looking values become a stable form so ``1.10`` and ``1.1`` join
-    as the same key; whole numbers stay without a trailing ``.0`` (``20`` not
-    ``20.0``). Non-numeric values stay as text.
+    One wrapping pair of double quotes is ignored first (``"PROD_A"`` joins
+    ``PROD_A``). Numeric-looking values then become a stable form so ``1.10``
+    and ``1.1`` join as the same key; whole numbers stay without a trailing
+    ``.0`` (``20`` not ``20.0``). Other text stays as it is.
     """
     if value is None:
         return ""
-    s = str(value)
+    s = unwrap_wrapping_quotes(str(value))
     if s == "":
         return ""
     try:
@@ -62,11 +75,13 @@ def normalize_key_part(value: object) -> str:
 
 def values_equal(a: object, b: object) -> bool:
     """
-    Compare two cell values: exact string match, or numeric equality when both
-    parse as floats (``1.10`` == ``1.1``).
+    Compare two cell values after dropping one wrapping pair of double quotes.
+
+    Exact string match, or numeric equality when both parse as floats
+    (``1.10`` == ``1.1``, ``"PROD_A"`` == ``PROD_A``).
     """
-    sa = "" if a is None else str(a)
-    sb = "" if b is None else str(b)
+    sa = unwrap_wrapping_quotes("" if a is None else str(a))
+    sb = unwrap_wrapping_quotes("" if b is None else str(b))
     if sa == sb:
         return True
     if sa == "" or sb == "":

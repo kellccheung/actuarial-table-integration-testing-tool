@@ -49,10 +49,21 @@ def test_values_equal_numeric_formats():
     assert values_equal("", "0") is False
 
 
+def test_values_equal_ignores_wrapping_quotes():
+    assert values_equal('"PROD_A"', "PROD_A")
+    assert values_equal('"1.10"', "1.1")
+    assert values_equal('""', "")
+    assert values_equal('"abc', "abc") is False
+
+
 def test_normalize_key_part_keeps_integers():
     assert normalize_key_part("20") == "20"
     assert normalize_key_part("1.10") == "1.1"
     assert normalize_key_part("PROD_A") == "PROD_A"
+    assert normalize_key_part('"PROD_A"') == "PROD_A"
+    assert normalize_key_part('"20"') == "20"
+    assert normalize_key_part('"1.10"') == "1.1"
+    assert normalize_key_part(" PROD ") == " PROD "
 
 
 def test_read_cp1252_fallback(tmp_path: Path):
@@ -140,6 +151,120 @@ def test_numeric_key_joins_despite_format(tmp_path: Path):
     updates = [r for r in result.change_rows if r.change_type == "value_update"]
     assert len(updates) == 1
     assert updates[0].key_tuple == "1.1"
+
+
+def test_quoted_key_matches_unquoted_key(tmp_path: Path):
+    before_path = tmp_path / "before.csv"
+    after_path = tmp_path / "after.csv"
+    before_path.write_text(
+        '!3,Age,Product,Rate\n*,20,"PROD_A",1.10\n',
+        encoding="utf-8",
+    )
+    after_path.write_text(
+        "!3,Age,Product,Rate\n*,20,PROD_A,1.2\n",
+        encoding="utf-8",
+    )
+    before = read_prophet_csv(before_path)
+    assert before.data["Product"][0] == '"PROD_A"'
+    result = diff_table(
+        "CR1",
+        "T",
+        before,
+        read_prophet_csv(after_path),
+        _minimal_control(tmp_path),
+    )
+    assert not any(r.change_type in {"row_add", "row_delete"} for r in result.change_rows)
+    updates = [r for r in result.change_rows if r.change_type == "value_update"]
+    assert len(updates) == 1
+    assert updates[0].key_tuple == "20|PROD_A"
+    assert updates[0].column_name == "Rate"
+    assert updates[0].old_value == "1.10"
+    assert updates[0].new_value == "1.2"
+
+
+def test_quoted_value_matches_unquoted_value(tmp_path: Path):
+    before_path = tmp_path / "before.csv"
+    after_path = tmp_path / "after.csv"
+    before_path.write_text(
+        '!2,Age,Note\n*,20,"ABC"\n',
+        encoding="utf-8",
+    )
+    after_path.write_text(
+        "!2,Age,Note\n*,20,ABC\n",
+        encoding="utf-8",
+    )
+    result = diff_table(
+        "CR1",
+        "T",
+        read_prophet_csv(before_path),
+        read_prophet_csv(after_path),
+        _minimal_control(tmp_path),
+    )
+    assert not any(r.change_type == "value_update" for r in result.change_rows)
+
+
+def test_quoted_value_change_keeps_raw_text(tmp_path: Path):
+    before_path = tmp_path / "before.csv"
+    after_path = tmp_path / "after.csv"
+    before_path.write_text(
+        '!2,Age,Note\n*,20,"ABC"\n',
+        encoding="utf-8",
+    )
+    after_path.write_text(
+        "!2,Age,Note\n*,20,DEF\n",
+        encoding="utf-8",
+    )
+    result = diff_table(
+        "CR1",
+        "T",
+        read_prophet_csv(before_path),
+        read_prophet_csv(after_path),
+        _minimal_control(tmp_path),
+    )
+    updates = [r for r in result.change_rows if r.change_type == "value_update"]
+    assert len(updates) == 1
+    assert updates[0].old_value == '"ABC"'
+    assert updates[0].new_value == "DEF"
+
+
+def test_quoted_header_matches_unquoted_header(tmp_path: Path):
+    before_path = tmp_path / "before.csv"
+    after_path = tmp_path / "after.csv"
+    before_path.write_text(
+        '!2,"Age",Rate\n*,20,0.5\n',
+        encoding="utf-8",
+    )
+    after_path.write_text(
+        "!2,Age,Rate\n*,20,0.6\n",
+        encoding="utf-8",
+    )
+    before = read_prophet_csv(before_path)
+    assert before.columns == ["Age", "Rate"]
+    result = diff_table(
+        "CR1",
+        "T",
+        before,
+        read_prophet_csv(after_path),
+        _minimal_control(tmp_path),
+    )
+    assert not any(
+        r.change_type in {"column_add", "column_delete", "column_rename"}
+        for r in result.change_rows
+    )
+    updates = [r for r in result.change_rows if r.change_type == "value_update"]
+    assert len(updates) == 1
+    assert updates[0].column_name == "Rate"
+
+
+def test_quoted_and_unquoted_same_key_is_duplicate(tmp_path: Path):
+    path = tmp_path / "t.csv"
+    path.write_text(
+        '!2,Code,Rate\n*,"A",1\n*,A,2\n',
+        encoding="utf-8",
+    )
+    table = read_prophet_csv(path)
+    with pytest.raises(ValueError, match="duplicate key"):
+        diff_table("CR1", "T", table, table, _minimal_control(tmp_path))
 
 
 def test_discover_recursive_subfolders(tmp_path: Path):

@@ -10,6 +10,8 @@ from pathlib import Path
 
 import polars as pl
 
+from .utils import unwrap_wrapping_quotes
+
 # Prophet exports are often named .FAC; change-request snapshots may use .csv.
 TABLE_EXTENSIONS = (".csv", ".fac")
 
@@ -56,9 +58,21 @@ class ProphetTable:
         return with_normalized_keys(self.data, self.key_columns)
 
 
+def unwrap_wrapping_quotes_expr(s: pl.Expr) -> pl.Expr:
+    """Polars form of :func:`unwrap_wrapping_quotes`. The stored cell is unchanged."""
+    trimmed = s.str.strip_chars()
+    quoted = (
+        trimmed.str.starts_with('"')
+        & trimmed.str.ends_with('"')
+        & (trimmed.str.len_chars() >= 2)
+    )
+    inner = trimmed.str.slice(1, trimmed.str.len_chars() - 2)
+    return pl.when(quoted).then(inner).otherwise(s)
+
+
 def normalized_key_expr(col: str) -> pl.Expr:
     """Polars expression: numeric-looking cells → canonical key text."""
-    s = pl.col(col).cast(pl.Utf8).fill_null("")
+    s = unwrap_wrapping_quotes_expr(pl.col(col).cast(pl.Utf8).fill_null(""))
     num = s.cast(pl.Float64, strict=False)
     is_numeric = num.is_not_null() & (s != "")
     is_int = is_numeric & (num == num.floor()) & (num.abs() < 1e15)
@@ -133,7 +147,7 @@ def _parse_header_cells(header_cells: list[str], path: Path) -> tuple[int, list[
     except (ValueError, IndexError) as exc:
         marker = header_cells[0] if header_cells else ""
         raise ValueError(f"Invalid key-count marker in {path}: {marker!r}") from exc
-    columns = header_cells[1:]
+    columns = [unwrap_wrapping_quotes(c) for c in header_cells[1:]]
     if n_keys < 1:
         raise ValueError(f"n_keys must be >= 1 in {path}, got {n_keys}")
     if n_keys - 1 > len(columns):

@@ -37,9 +37,12 @@ Every table follows this exact structure:
 - Row 1, Columns 2 onwards: actual column headers.
 - Data rows: first cell is always `*`, followed by key values and data values.
 - Key columns = first `N` columns (the marker column + the next `N-1` columns).
-- All comparisons and matching use **numeric-aware equality** for values that
-  parse as floats (e.g. `1.10` equals `1.1`); otherwise exact string match.
-  Keys are joined after the same numeric normalization.
+- All comparisons and matching ignore one pair of wrapping double quotes
+  (`"PROD_A"` equals `PROD_A`), then use **numeric-aware equality** for values
+  that parse as floats (e.g. `1.10` equals `1.1`); otherwise exact string match.
+  Keys are joined after the same unquote and numeric normalization. Written
+  cells keep the quotes they were read with. A comma inside quotes still splits
+  the field, and `""` inside a value stays two quote characters.
 
 When writing output tables, the exact `!N` + `*` format must be preserved.
 

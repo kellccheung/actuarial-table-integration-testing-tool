@@ -103,7 +103,7 @@ Edited on 2026,,,,,
 | Headers | Remaining cells on the `!N` row are column names |
 | Data rows | First cell is always `*`, then key values and data values |
 | Dummy lines | Lines before `!N` and after the last `*` row are ignored for Change Log comparison; Stage 2 keeps production’s dummy lines as-is |
-| Matching | Numeric when both sides parse as numbers (`1.10` equals `1.1`); otherwise exact string |
+| Matching | One pair of wrapping `"` is ignored (`"PROD_A"` equals `PROD_A`), then numeric when both sides parse as numbers (`1.10` equals `1.1`); otherwise exact string. Written cells keep the quotes they were read with |
 
 Example: `!4` means keys are the marker + the next 3 columns (`Age`, `Duration`, `Product`).
 

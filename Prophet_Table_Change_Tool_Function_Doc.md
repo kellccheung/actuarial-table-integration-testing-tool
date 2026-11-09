@@ -38,9 +38,10 @@ Every table follows this exact structure:
 - Data rows: first cell is always `*`, followed by key values and data values.
 - Key columns = first `N` columns (the marker column + the next `N-1` columns).
 - All comparisons and matching ignore one pair of wrapping double quotes
-  (`"PROD_A"` equals `PROD_A`), then use **numeric-aware equality** for values
-  that parse as floats (e.g. `1.10` equals `1.1`); otherwise exact string match.
-  Keys are joined after the same unquote and numeric normalization. Written
+  (`"PROD_A"` equals `PROD_A`). Text containing an ASCII letter stays text
+  (`10E05` is not read as `1000000`). Other values use **numeric-aware equality**
+  when they parse as floats (e.g. `1.10` equals `1.1`); otherwise exact string
+  match. Keys are joined after the same unquote and normalization. Written
   cells keep the quotes they were read with. A comma inside quotes still splits
   the field, and `""` inside a value stays two quote characters.
 

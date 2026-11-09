@@ -70,11 +70,16 @@ def unwrap_wrapping_quotes_expr(s: pl.Expr) -> pl.Expr:
     return pl.when(quoted).then(inner).otherwise(s)
 
 
+def contains_letter_expr(s: pl.Expr) -> pl.Expr:
+    """Polars form of :func:`contains_letter`. ``10E05`` stays text."""
+    return s.str.contains(r"[A-Za-z]")
+
+
 def normalized_key_expr(col: str) -> pl.Expr:
     """Polars expression: numeric-looking cells → canonical key text."""
     s = unwrap_wrapping_quotes_expr(pl.col(col).cast(pl.Utf8).fill_null(""))
     num = s.cast(pl.Float64, strict=False)
-    is_numeric = num.is_not_null() & (s != "")
+    is_numeric = num.is_not_null() & (s != "") & ~contains_letter_expr(s)
     is_int = is_numeric & (num == num.floor()) & (num.abs() < 1e15)
     return (
         pl.when(is_int)

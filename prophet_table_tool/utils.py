@@ -50,20 +50,29 @@ def unwrap_wrapping_quotes(value: str) -> str:
     return value
 
 
+def contains_letter(value: str) -> bool:
+    """True when *value* contains an ASCII letter.
+
+    ``10E05`` stays text. ``float`` would read the ``E`` as scientific notation.
+    """
+    return any(("A" <= char <= "Z") or ("a" <= char <= "z") for char in value)
+
+
 def normalize_key_part(value: object) -> str:
     """
     Canonicalize one key cell for matching.
 
     One wrapping pair of double quotes is ignored first (``"PROD_A"`` joins
-    ``PROD_A``). Numeric-looking values then become a stable form so ``1.10``
-    and ``1.1`` join as the same key; whole numbers stay without a trailing
-    ``.0`` (``20`` not ``20.0``). Other text stays as it is.
+    ``PROD_A``). Text with an ASCII letter stays as it is (``10E05`` does not
+    become ``1000000``). Other numeric-looking values become a stable form so
+    ``1.10`` and ``1.1`` join as the same key; whole numbers stay without a
+    trailing ``.0`` (``20`` not ``20.0``).
     """
     if value is None:
         return ""
     s = unwrap_wrapping_quotes(str(value))
-    if s == "":
-        return ""
+    if s == "" or contains_letter(s):
+        return s
     try:
         f = float(s)
     except (TypeError, ValueError):
@@ -77,14 +86,14 @@ def values_equal(a: object, b: object) -> bool:
     """
     Compare two cell values after dropping one wrapping pair of double quotes.
 
-    Exact string match, or numeric equality when both parse as floats
-    (``1.10`` == ``1.1``, ``"PROD_A"`` == ``PROD_A``).
+    Exact string match, or numeric equality when both parse as floats and
+    neither contains a letter (``1.10`` == ``1.1``, ``"10E05"`` == ``10E05``).
     """
     sa = unwrap_wrapping_quotes("" if a is None else str(a))
     sb = unwrap_wrapping_quotes("" if b is None else str(b))
     if sa == sb:
         return True
-    if sa == "" or sb == "":
+    if sa == "" or sb == "" or contains_letter(sa) or contains_letter(sb):
         return False
     try:
         return float(sa) == float(sb)

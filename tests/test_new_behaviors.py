@@ -54,6 +54,9 @@ def test_values_equal_ignores_wrapping_quotes():
     assert values_equal('"1.10"', "1.1")
     assert values_equal('""', "")
     assert values_equal('"abc', "abc") is False
+    assert values_equal('"10E05"', "10E05")
+    assert values_equal("10E05", "1000000") is False
+    assert values_equal("1E-3", "0.001") is False
 
 
 def test_normalize_key_part_keeps_integers():
@@ -64,6 +67,8 @@ def test_normalize_key_part_keeps_integers():
     assert normalize_key_part('"20"') == "20"
     assert normalize_key_part('"1.10"') == "1.1"
     assert normalize_key_part(" PROD ") == " PROD "
+    assert normalize_key_part('"10E05"') == "10E05"
+    assert normalize_key_part("10E05") == "10E05"
 
 
 def test_read_cp1252_fallback(tmp_path: Path):
@@ -265,6 +270,52 @@ def test_quoted_and_unquoted_same_key_is_duplicate(tmp_path: Path):
     table = read_prophet_csv(path)
     with pytest.raises(ValueError, match="duplicate key"):
         diff_table("CR1", "T", table, table, _minimal_control(tmp_path))
+
+
+def test_letter_product_code_key_stays_text(tmp_path: Path):
+    before_path = tmp_path / "before.csv"
+    after_path = tmp_path / "after.csv"
+    before_path.write_text(
+        '!3,Age,Product,Rate\n*,20,"10E05",1.10\n',
+        encoding="utf-8",
+    )
+    after_path.write_text(
+        "!3,Age,Product,Rate\n*,20,10E05,1.2\n",
+        encoding="utf-8",
+    )
+    result = diff_table(
+        "CR1",
+        "T",
+        read_prophet_csv(before_path),
+        read_prophet_csv(after_path),
+        _minimal_control(tmp_path),
+    )
+    assert not any(r.change_type in {"row_add", "row_delete"} for r in result.change_rows)
+    updates = [r for r in result.change_rows if r.change_type == "value_update"]
+    assert len(updates) == 1
+    assert updates[0].key_tuple == "20|10E05"
+    assert updates[0].column_name == "Rate"
+
+
+def test_letter_product_code_value_matches_unquoted(tmp_path: Path):
+    before_path = tmp_path / "before.csv"
+    after_path = tmp_path / "after.csv"
+    before_path.write_text(
+        '!2,Age,Product\n*,20,"10E05"\n',
+        encoding="utf-8",
+    )
+    after_path.write_text(
+        "!2,Age,Product\n*,20,10E05\n",
+        encoding="utf-8",
+    )
+    result = diff_table(
+        "CR1",
+        "T",
+        read_prophet_csv(before_path),
+        read_prophet_csv(after_path),
+        _minimal_control(tmp_path),
+    )
+    assert not any(r.change_type == "value_update" for r in result.change_rows)
 
 
 def test_discover_recursive_subfolders(tmp_path: Path):

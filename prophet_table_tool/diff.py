@@ -9,6 +9,7 @@ import polars as pl
 from .control import ControlConfig
 from .prophet_csv import (
     ProphetTable,
+    contains_letter_expr,
     require_unique_keys,
     unwrap_wrapping_quotes_expr,
     with_normalized_keys,
@@ -151,14 +152,22 @@ def concat_cell_changes(frames: list[pl.DataFrame]) -> pl.DataFrame:
 def _cells_differ_expr(old_col: str, new_col: str) -> pl.Expr:
     """True when old/new are not equal as strings and not equal as floats.
 
-    One wrapping pair of double quotes is ignored. The changelog still stores
-    the raw cell text.
+    One wrapping pair of double quotes is ignored. Text with an ASCII letter
+    stays text, so ``10E05`` is not equal to ``1000000``. The changelog still
+    stores the raw cell text.
     """
     old_s = unwrap_wrapping_quotes_expr(pl.col(old_col).cast(pl.Utf8).fill_null(""))
     new_s = unwrap_wrapping_quotes_expr(pl.col(new_col).cast(pl.Utf8).fill_null(""))
     old_f = old_s.cast(pl.Float64, strict=False)
     new_f = new_s.cast(pl.Float64, strict=False)
-    both_numeric = old_f.is_not_null() & new_f.is_not_null() & (old_s != "") & (new_s != "")
+    both_numeric = (
+        old_f.is_not_null()
+        & new_f.is_not_null()
+        & (old_s != "")
+        & (new_s != "")
+        & ~contains_letter_expr(old_s)
+        & ~contains_letter_expr(new_s)
+    )
     numeric_eq = both_numeric & (old_f == new_f)
     string_eq = old_s == new_s
     return ~(string_eq | numeric_eq)

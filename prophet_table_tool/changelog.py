@@ -30,7 +30,7 @@ from .diff import (
     empty_cell_changes,
     rows_to_cell_df,
 )
-from .prophet_csv import ProphetTable, read_prophet_csv, read_prophet_header
+from .prophet_csv import ProphetTable, read_prophet_csv, read_prophet_header, require_unique_keys
 from .utils import file_hash, generate_run_id
 
 
@@ -439,15 +439,21 @@ def _unique_group_filename(base: str, used: set[str]) -> str:
 def run_structure_scan(control: ControlConfig) -> tuple[Path, list[dict]]:
     """Write StructureScan_<run_id>.xlsx and return ``(path, findings)``."""
     control.output_path.mkdir(parents=True, exist_ok=True)
-    findings = scan_structure(control)
+    findings = scan_structure(control, check_duplicate_keys=True)
     path = _write_structure_scan(
         control.output_path, control.run_id or "scan", findings
     )
     return path, findings
 
 
-def scan_structure(control: ControlConfig) -> list[dict]:
-    """Header-only check of each included change request. Does not diff cell values."""
+def scan_structure(
+    control: ControlConfig, *, check_duplicate_keys: bool = False
+) -> list[dict]:
+    """Header check of each included change request. Does not diff cell values.
+
+    ``check_duplicate_keys`` is scan mode only, so changelog generation does not
+    read each table twice.
+    """
     findings: list[dict] = []
     for cr in control.included_requests(require_approved=False):
         try:
@@ -492,7 +498,13 @@ def scan_structure(control: ControlConfig) -> list[dict]:
             continue
         if not production:
             for table_name in sorted(set(before_tables) - set(after_tables)):
-                _scan_header(findings, cr.change_request_id, table_name, before_tables[table_name])
+                _scan_header(
+                    findings,
+                    cr.change_request_id,
+                    table_name,
+                    before_tables[table_name],
+                    check_duplicate_keys=check_duplicate_keys,
+                )
                 _finding(
                     findings,
                     cr.change_request_id,
@@ -509,9 +521,16 @@ def scan_structure(control: ControlConfig) -> list[dict]:
                 table_name,
                 before_tables[table_name],
                 after_tables[table_name],
+                check_duplicate_keys=check_duplicate_keys,
             )
         for table_name in sorted(set(after_tables) - set(before_tables)):
-            _scan_header(findings, cr.change_request_id, table_name, after_tables[table_name])
+            _scan_header(
+                findings,
+                cr.change_request_id,
+                table_name,
+                after_tables[table_name],
+                check_duplicate_keys=check_duplicate_keys,
+            )
     return findings
 
 
@@ -537,6 +556,8 @@ def _scan_header(
     change_request_id: str,
     table_name: str,
     path: Path,
+    *,
+    check_duplicate_keys: bool = False,
 ) -> tuple[int, list[str]] | None:
     try:
         n_keys, columns = read_prophet_header(path)
@@ -545,6 +566,7 @@ def _scan_header(
         return None
     duplicates = _duplicate_names(columns)
     if duplicates:
+        # Skip the body read: repeated names collapse in the reader schema.
         _finding(
             findings,
             change_request_id,
@@ -553,6 +575,14 @@ def _scan_header(
             f"[{change_request_id}] Table '{table_name}' has duplicate column names: "
             f"{duplicates}",
         )
+    elif check_duplicate_keys:
+        try:
+            table = read_prophet_csv(path)
+            require_unique_keys(
+                table, f"[{change_request_id}] Table '{table_name}' {path}"
+            )
+        except ValueError as exc:
+            _finding(findings, change_request_id, table_name, "FATAL", str(exc))
     return n_keys, columns
 
 
@@ -563,9 +593,23 @@ def _scan_pair(
     table_name: str,
     before_path: Path,
     after_path: Path,
+    *,
+    check_duplicate_keys: bool = False,
 ) -> None:
-    before = _scan_header(findings, change_request_id, table_name, before_path)
-    after = _scan_header(findings, change_request_id, table_name, after_path)
+    before = _scan_header(
+        findings,
+        change_request_id,
+        table_name,
+        before_path,
+        check_duplicate_keys=check_duplicate_keys,
+    )
+    after = _scan_header(
+        findings,
+        change_request_id,
+        table_name,
+        after_path,
+        check_duplicate_keys=check_duplicate_keys,
+    )
     if before is None or after is None:
         return
     before_n, before_cols = before

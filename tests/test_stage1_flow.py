@@ -8,7 +8,12 @@ from pathlib import Path
 import pytest
 from openpyxl import Workbook, load_workbook
 
-from prophet_table_tool.changelog import StructureScanError, generate_change_log, scan_structure
+from prophet_table_tool.changelog import (
+    StructureScanError,
+    generate_change_log,
+    run_structure_scan,
+    scan_structure,
+)
 from prophet_table_tool.control import (
     ControlConfig,
     KeyCountApproval,
@@ -211,3 +216,44 @@ def test_two_requests_spill_still_reports_overlap(tmp_path: Path):
     assert "MORT_TABLE" in review_wb.sheetnames
     review_wb.close()
     assert not (tmp_path / "Output" / ".stage1_STAGE1").exists()
+
+
+def test_scan_reports_duplicate_index_key(tmp_path: Path):
+    before = tmp_path / "ChangeRequests" / "CR_DUP" / "before"
+    after = tmp_path / "ChangeRequests" / "CR_DUP" / "after"
+    _write_table(
+        before / "MORT_TABLE.csv",
+        2,
+        ["Age", "Rate"],
+        [["20", "0.1"], ["21", "0.2"]],
+    )
+    _write_table(
+        after / "MORT_TABLE.csv",
+        2,
+        ["Age", "Rate"],
+        [["20", "0.1"], ["20", "0.3"]],
+    )
+    _write_table(before / "DUP_COL.csv", 2, ["Age", "Age"], [["20", "0.1"]])
+    _write_table(after / "DUP_COL.csv", 2, ["Age", "Age"], [["20", "0.2"]])
+    (tmp_path / "Production_Tables").mkdir()
+    control_path = tmp_path / "Control.xlsx"
+    _write_control(
+        control_path,
+        working_root=tmp_path,
+        change_requests=[("CR_DUP", 1, "Y", "Y", "dup key", "")],
+        run_id="SCAN",
+    )
+    control = read_control(control_path)
+    gate = scan_structure(control)
+    assert not any("duplicate key" in row["message"] for row in gate)
+
+    scan_path, findings = run_structure_scan(control)
+    assert scan_path.is_file()
+    assert any(
+        row["severity"] == "FATAL" and "duplicate key" in row["message"]
+        for row in findings
+    )
+    assert any(
+        row["table_name"] == "DUP_COL" and "duplicate column names" in row["message"]
+        for row in findings
+    )

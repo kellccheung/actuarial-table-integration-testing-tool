@@ -134,7 +134,7 @@ def generate_change_log(control_path: Path) -> Path:
 
 **Logic:**
 1. Read `Control.xlsx` → list of included change requests sorted by `order`.
-2. Scan each table's `!N` header and write `Output/StructureScan_<run_id>.xlsx`. Fatal findings stop the run. `mode=scan` writes that report and does not diff cells.
+2. Scan each table's `!N` header and write `Output/StructureScan_<run_id>.xlsx`. Fatal findings stop the run. `mode=scan` writes that report, reads each table's data rows, and flags a duplicated index key. It does not diff cells.
 3. For each change request, one at a time:
    - Discover all CSV/FAC files in `before/` and `after/` **recursively**.
      Table identity is the posix relative path without suffix (e.g. `SubA/MORT_TABLE`).

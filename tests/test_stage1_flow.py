@@ -249,6 +249,9 @@ def test_scan_reports_duplicate_index_key(tmp_path: Path):
 
     scan_path, findings = run_structure_scan(control)
     assert scan_path.is_file()
+    log_text = (tmp_path / "Output" / "Audit" / "SCAN_scan.log").read_text(encoding="utf-8")
+    assert "scanning MORT_TABLE" in log_text
+    assert "finished MORT_TABLE" in log_text
     assert any(
         row["severity"] == "FATAL" and "duplicate key" in row["message"]
         for row in findings

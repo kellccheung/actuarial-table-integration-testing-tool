@@ -439,15 +439,27 @@ def _unique_group_filename(base: str, used: set[str]) -> str:
 def run_structure_scan(control: ControlConfig) -> tuple[Path, list[dict]]:
     """Write StructureScan_<run_id>.xlsx and return ``(path, findings)``."""
     control.output_path.mkdir(parents=True, exist_ok=True)
-    findings = scan_structure(control, check_duplicate_keys=True)
-    path = _write_structure_scan(
-        control.output_path, control.run_id or "scan", findings
-    )
-    return path, findings
+    run_id = control.run_id or "scan"
+    logger, _log_path = setup_audit_logger(control.output_path, run_id, "scan")
+    try:
+        findings = scan_structure(
+            control, check_duplicate_keys=True, logger=logger
+        )
+        path = _write_structure_scan(control.output_path, run_id, findings)
+        n_fatal = sum(1 for row in findings if row["severity"] == "FATAL")
+        logger.info(
+            "structure_scan=%s fatal=%d findings=%d", path, n_fatal, len(findings)
+        )
+        return path, findings
+    finally:
+        close_audit_logger(logger)
 
 
 def scan_structure(
-    control: ControlConfig, *, check_duplicate_keys: bool = False
+    control: ControlConfig,
+    *,
+    check_duplicate_keys: bool = False,
+    logger: logging.Logger | None = None,
 ) -> list[dict]:
     """Header check of each included change request. Does not diff cell values.
 
@@ -496,8 +508,30 @@ def scan_structure(
                 f"[{cr.change_request_id}] No table files for this change request.",
             )
             continue
+        n_tables = len(set(before_tables) | set(after_tables))
+        scan_index = 0
+        if logger is not None:
+            logger.info("[%s] %d table(s) to scan", cr.change_request_id, n_tables)
+
+        def _scan_progress(table_name: str, *, done: bool = False) -> None:
+            nonlocal scan_index
+            if logger is None:
+                return
+            if done:
+                logger.info("[%s] finished %s", cr.change_request_id, table_name)
+                return
+            scan_index += 1
+            logger.info(
+                "[%s] scanning %s (%d/%d)",
+                cr.change_request_id,
+                table_name,
+                scan_index,
+                n_tables,
+            )
+
         if not production:
             for table_name in sorted(set(before_tables) - set(after_tables)):
+                _scan_progress(table_name)
                 _scan_header(
                     findings,
                     cr.change_request_id,
@@ -513,7 +547,9 @@ def scan_structure(
                     f"[{cr.change_request_id}] Table '{table_name}' exists only "
                     "in before/ — skipped (no automatic deletes).",
                 )
+                _scan_progress(table_name, done=True)
         for table_name in sorted(set(before_tables) & set(after_tables)):
+            _scan_progress(table_name)
             _scan_pair(
                 findings,
                 control,
@@ -523,7 +559,9 @@ def scan_structure(
                 after_tables[table_name],
                 check_duplicate_keys=check_duplicate_keys,
             )
+            _scan_progress(table_name, done=True)
         for table_name in sorted(set(after_tables) - set(before_tables)):
+            _scan_progress(table_name)
             _scan_header(
                 findings,
                 cr.change_request_id,
@@ -531,6 +569,7 @@ def scan_structure(
                 after_tables[table_name],
                 check_duplicate_keys=check_duplicate_keys,
             )
+            _scan_progress(table_name, done=True)
     return findings
 
 

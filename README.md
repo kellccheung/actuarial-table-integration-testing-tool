@@ -251,7 +251,7 @@ A conflict is ignored in Stage 2 only if you mark `resolved=Y`, delete that Conf
 | Type | Raised when | Typical example |
 |------|-------------|-----------------|
 | `cell_overlap` | Two or more CRs touch the **same cell** (same table + same key combination + same column) with `value_update`, `row_add`, or `row_delete`. Still flagged when both CRs write the same `new_value` (numeric-aware: `1.10` equals `1.1`), and when a `row_add` or `column_add` is followed by a `value_update`. Set `resolved=Y` to apply both in Control `order` (later CR wins). | CR_A and CR_B both change `Rate` for `Age=20, Duration=1, Product=PROD_A`. |
-| `structural_collision` | Two or more CRs apply **structural** changes to the **same table**. Structural types: `column_add`, `column_delete`, `column_rename`, `key_count_change`, `table_add`. Different columns still collide if they are on the same table. | CR_A adds a column and CR_B renames another column on `MORT_TABLE`. |
+| `structural_collision` | Two or more CRs apply **structural** changes to the **same table**. Structural types: `column_add`, `column_delete`, `column_rename`, `key_count_change`, `table_add`. Different columns still collide if they are on the same table. Set `resolved=Y` to apply every included CR’s structural rows in Control `order`; both edits stay. | CR_A adds a column and CR_B renames another column on `MORT_TABLE`. |
 | `missing_row_column_fill` | A `row_add` and a `column_add` on the same table leave their **intersection cell** with no covering `row_add` / `value_update` in the Detail CSV. Can be one CR or several. | CR_A adds a new age row; CR_B adds `NewCol`; neither supplies a value for that new row × `NewCol`. |
 
 Not a conflict (handled elsewhere): a table only in `before/` (warning + skip), an undeclared column rename, or an unapproved key-count change. Those are separate hard-stops — see [Safety rules](#safety-rules-what-will-block-you).
@@ -285,7 +285,11 @@ To drop one CR’s change instead of last-writer-wins:
 - Edit that CR’s `before/` / `after/` so it no longer changes the cell, then re-run Stage 1.
 - Edit `ChangeLog_*_Detail.csv`: delete or change the losing CR’s rows for that table + key + column, **and** set `resolved = Y` on the Conflicts row. Editing Detail alone does not clear the Conflicts sheet.
 
-**`structural_collision`** — do not leave two structural CRs on the same table in one run. Merge the structural work into a **single** CR folder (one `before/` / `after/` pair), or exclude one CR, then re-run Stage 1. Mark `resolved = Y` only if you have already merged or sequenced the work by hand and accept applying the remaining Detail rows as-is.
+**`structural_collision`** — `resolved = Y` applies every included, approved CR’s structural Detail rows for that table, in Control `order`, stacked on the running table. Both edits stay. CR_A adds `NewCol` and CR_B adds `ExtraCol`: after `resolved = Y` the table has both columns. The later CR does not replace the earlier structural change. Last-writer-wins applies only to `cell_overlap`. Integration Report **`Overlap_Winners`** has no row for this type.
+
+To keep only one CR, set `include = N` on the other, or merge both edits into one `before/` / `after/` pair, then re-run Stage 1.
+
+Use `resolved = Y` only after you have checked that the two edits still fit once stacked. Each CR was diffed against its own `before/`, so an earlier rename, delete, or key-count change can make the later CR skip, fail, or reshape the table.
 
 **`missing_row_column_fill`** — supply the missing cell:
 
@@ -294,7 +298,7 @@ To drop one CR’s change instead of last-writer-wins:
 
 ### Marking `resolved = Y`
 
-On the Conflicts sheet, change `resolved` from `N` to `Y` (also accepted: `YES`, `TRUE`, `1`). Use this only after you have decided the outcome — accepted last-writer-wins in Control `order` (including same-value overlap, sequenced `row_add`/`column_add` then `value_update`, or differing independent updates), edited Detail, excluded CRs, merged folders, or confirmed a blank fill.
+On the Conflicts sheet, change `resolved` from `N` to `Y` (also accepted: `YES`, `TRUE`, `1`). Use this only after you have decided the outcome. For `cell_overlap`, that is last-writer-wins in Control `order` (same-value overlap, sequenced `row_add`/`column_add` then `value_update`, or differing independent updates). For `structural_collision`, both structural edits are kept. You may also have edited Detail, excluded CRs, merged folders, or confirmed a blank fill.
 
 Then run `validate_only`, and only then `apply`.
 

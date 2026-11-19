@@ -103,7 +103,7 @@ Edited on 2026,,,,,
 | Headers | Remaining cells on the `!N` row are column names |
 | Data rows | First cell is always `*`, then key values and data values |
 | Dummy lines | Lines before `!N` and after the last `*` row are ignored for Change Log comparison; Stage 2 keeps production’s dummy lines as-is |
-| Matching | One pair of wrapping `"` is ignored (`"PROD_A"` equals `PROD_A`). Text containing a letter stays text (`10E05` is not `1000000`). Otherwise numeric when both sides parse as numbers (`1.10` equals `1.1`); otherwise exact string. Written cells keep the quotes they were read with |
+| Matching | One pair of wrapping `"` is ignored (`"PROD_A"` equals `PROD_A`). Index columns match as that text (`0` and `000` are different keys). Data cells are numeric when both sides parse as numbers and contain no letter (`1.10` equals `1.1`; `10E05` stays text); otherwise exact string. Written cells keep the quotes they were read with |
 
 Example: `!4` means keys are the marker + the next 3 columns (`Age`, `Duration`, `Product`).
 
@@ -188,7 +188,7 @@ Folder review workbooks:
 - **Conflicts** — rows whose `table_name` belongs to that folder
 - **One sheet per touched table** — human review only (changed rows); Stage 2 ignores these sheets. The `_change` column shows `[change_request_id]` for each changed row, with an `ADD` / `DELETE` prefix when the row was added or removed.
 
-Value comparison is **numeric-aware** (`1.10` equals `1.1`). CSV files are read
+Value comparison is **numeric-aware** (`1.10` equals `1.1`). Index columns match as text (`0` and `000` stay distinct). CSV files are read
 with encoding fallback: utf-8-sig → utf-8 → cp1252 → latin-1.
 
 ```bash
@@ -332,7 +332,7 @@ Each audit log line starts with a local timestamp. The log also records mode, Co
 | Table only in `before/` | Warning + skip (no auto-delete) |
 | `validate_only` | Never writes new production tables |
 
-Matching is **numeric-aware** (`1.10` equals `1.1`); other values must match as text. Re-running the same Change Log on the same production snapshot is designed to be **idempotent**.
+Index keys match as text (`0` and `000` stay distinct). Data cells are **numeric-aware** (`1.10` equals `1.1`). Re-running the same Change Log on the same production snapshot is designed to be **idempotent**.
 
 ---
 

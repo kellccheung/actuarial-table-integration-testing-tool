@@ -60,26 +60,14 @@ def contains_letter(value: str) -> bool:
 
 def normalize_key_part(value: object) -> str:
     """
-    Canonicalize one key cell for matching.
+    One index cell for matching.
 
-    One wrapping pair of double quotes is ignored first (``"PROD_A"`` joins
-    ``PROD_A``). Text with an ASCII letter stays as it is (``10E05`` does not
-    become ``1000000``). Other numeric-looking values become a stable form so
-    ``1.10`` and ``1.1`` join as the same key; whole numbers stay without a
-    trailing ``.0`` (``20`` not ``20.0``).
+    Index columns stay text. One wrapping pair of double quotes is ignored
+    (``"PROD_A"`` joins ``PROD_A``). ``0`` and ``000`` stay different keys.
     """
     if value is None:
         return ""
-    s = unwrap_wrapping_quotes(str(value))
-    if s == "" or contains_letter(s):
-        return s
-    try:
-        f = float(s)
-    except (TypeError, ValueError):
-        return s
-    if f.is_integer() and abs(f) < 1e15:
-        return str(int(f))
-    return str(f)
+    return unwrap_wrapping_quotes(str(value))
 
 
 def values_equal(a: object, b: object) -> bool:

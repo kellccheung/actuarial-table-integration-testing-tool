@@ -24,6 +24,7 @@ from prophet_table_tool.prophet_csv import (
     ProphetTable,
     discover_csv_tables,
     read_prophet_csv,
+    require_unique_keys,
 )
 from prophet_table_tool.utils import normalize_key_part, values_equal
 
@@ -59,13 +60,15 @@ def test_values_equal_ignores_wrapping_quotes():
     assert values_equal("1E-3", "0.001") is False
 
 
-def test_normalize_key_part_keeps_integers():
+def test_normalize_key_part_keeps_text():
     assert normalize_key_part("20") == "20"
-    assert normalize_key_part("1.10") == "1.1"
+    assert normalize_key_part("0") == "0"
+    assert normalize_key_part("000") == "000"
+    assert normalize_key_part("1.10") == "1.10"
     assert normalize_key_part("PROD_A") == "PROD_A"
     assert normalize_key_part('"PROD_A"') == "PROD_A"
     assert normalize_key_part('"20"') == "20"
-    assert normalize_key_part('"1.10"') == "1.1"
+    assert normalize_key_part('"1.10"') == "1.10"
     assert normalize_key_part(" PROD ") == " PROD "
     assert normalize_key_part('"10E05"') == "10E05"
     assert normalize_key_part("10E05") == "10E05"
@@ -134,7 +137,7 @@ def test_numeric_value_compare_detects_real_diff(tmp_path: Path):
     assert updates[0].new_value == "1.2"
 
 
-def test_numeric_key_joins_despite_format(tmp_path: Path):
+def test_numeric_format_keys_do_not_join(tmp_path: Path):
     before_path = tmp_path / "before.csv"
     after_path = tmp_path / "after.csv"
     before_path.write_text(
@@ -152,10 +155,41 @@ def test_numeric_key_joins_despite_format(tmp_path: Path):
         read_prophet_csv(after_path),
         _minimal_control(tmp_path),
     )
+    assert not any(r.change_type == "value_update" for r in result.change_rows)
+    deletes = [r for r in result.change_rows if r.change_type == "row_delete"]
+    adds = [r for r in result.change_rows if r.change_type == "row_add"]
+    assert {r.key_tuple for r in deletes} == {"1.10"}
+    assert {r.key_tuple for r in adds} == {"1.1"}
+
+
+def test_leading_zero_index_keys_stay_distinct(tmp_path: Path):
+    before_path = tmp_path / "before.csv"
+    after_path = tmp_path / "after.csv"
+    before_path.write_text(
+        "!2,Code,Rate\n*,0,0.1\n*,000,0.2\n",
+        encoding="utf-8",
+    )
+    after_path.write_text(
+        "!2,Code,Rate\n*,0,0.1\n*,000,0.3\n",
+        encoding="utf-8",
+    )
+    before = read_prophet_csv(before_path)
+    after = read_prophet_csv(after_path)
+    require_unique_keys(before, "before")
+    require_unique_keys(after, "after")
+    result = diff_table(
+        "CR1",
+        "T",
+        before,
+        after,
+        _minimal_control(tmp_path),
+    )
     assert not any(r.change_type in {"row_add", "row_delete"} for r in result.change_rows)
     updates = [r for r in result.change_rows if r.change_type == "value_update"]
     assert len(updates) == 1
-    assert updates[0].key_tuple == "1.1"
+    assert updates[0].key_tuple == "000"
+    assert updates[0].old_value == "0.2"
+    assert updates[0].new_value == "0.3"
 
 
 def test_quoted_key_matches_unquoted_key(tmp_path: Path):

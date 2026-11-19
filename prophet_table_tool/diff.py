@@ -233,8 +233,9 @@ def diff_table(
     """
     Compute detailed changes between before and after for one table.
 
-    Value comparison is numeric-aware (``1.10`` == ``1.1``). Keys are joined
-    after the same numeric normalization.
+    Value comparison is numeric-aware (``1.10`` == ``1.1``). Index columns
+    are joined as text after dropping one wrapping pair of quotes (``0`` and
+    ``000`` are different keys).
     """
     result = DiffResult()
 

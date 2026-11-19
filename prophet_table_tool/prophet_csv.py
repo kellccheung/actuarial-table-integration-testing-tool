@@ -54,7 +54,7 @@ class ProphetTable:
         return ".csv"
 
     def with_key_tuple(self) -> pl.DataFrame:
-        """Return data with synthetic ``_key_str`` (normalized, pipe-joined)."""
+        """Return data with synthetic ``_key_str`` (text keys, pipe-joined)."""
         return with_normalized_keys(self.data, self.key_columns)
 
 
@@ -76,34 +76,24 @@ def contains_letter_expr(s: pl.Expr) -> pl.Expr:
 
 
 def normalized_key_expr(col: str) -> pl.Expr:
-    """Polars expression: numeric-looking cells → canonical key text."""
-    s = unwrap_wrapping_quotes_expr(pl.col(col).cast(pl.Utf8).fill_null(""))
-    num = s.cast(pl.Float64, strict=False)
-    is_numeric = num.is_not_null() & (s != "") & ~contains_letter_expr(s)
-    is_int = is_numeric & (num == num.floor()) & (num.abs() < 1e15)
-    return (
-        pl.when(is_int)
-        .then(num.cast(pl.Int64).cast(pl.Utf8))
-        .when(is_numeric)
-        .then(num.cast(pl.Utf8))
-        .otherwise(s)
-    )
+    """One index cell as text. Wrapping quotes are dropped; ``0`` stays distinct from ``000``."""
+    return unwrap_wrapping_quotes_expr(pl.col(col).cast(pl.Utf8).fill_null(""))
 
 
 def key_str_expr(key_cols: list[str]) -> pl.Expr:
-    """Pipe-join normalized key columns; empty key list → empty string."""
+    """Pipe-join index columns as text; empty key list → empty string."""
     if not key_cols:
         return pl.lit("")
     return pl.concat_str([normalized_key_expr(c) for c in key_cols], separator="|")
 
 
 def with_normalized_keys(df: pl.DataFrame, key_cols: list[str]) -> pl.DataFrame:
-    """Add ``_key_str`` (pipe-joined) with numeric key normalization."""
+    """Add ``_key_str`` (pipe-joined text keys, wrapping quotes dropped)."""
     return df.with_columns(key_str_expr(key_cols).alias("_key_str"))
 
 
 def require_unique_keys(table: ProphetTable, label: str) -> None:
-    """Raise when two data rows share one normalized key."""
+    """Raise when two data rows share one text key."""
     if table.data.height < 2:
         return
     dup = (
